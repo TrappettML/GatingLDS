@@ -50,12 +50,42 @@ here too:
                 set by the pool size n_b.  Thinning B at fixed F therefore leaves
                 the coupling where it was and makes it noisier.
 
+The other free choice is how COARSE the gating is, which the note leaves open in a
+line -- a row of ones is a gated neuron, a single entry a gated synapse, and a block
+of entries a gated dendritic branch, and the algebra does not distinguish them.  A
+neuron here is a row of W and its N_in = D entries are the synapses on it, so the
+granularity is a grouping of the D columns:
+
+    N_d   dendrites per neuron, a whole factor of D, carrying N_s = D / N_d
+          synapses each.  Columns a and a' share a mask iff a // N_s == a' // N_s,
+          and different dendrites are drawn independently.
+
+    N_d = D       one synapse per dendrite, every column independent: SYNAPTIC
+                  gating, what this file did before N_d existed, and the default
+    N_d = 1       one dendrite carrying the row, so the masks are row-constant and
+                  a neuron is on or off as a whole: NEURONAL gating
+    1 < N_d < D   blocks of N_s columns gated together: DENDRITIC gating
+
+Nothing in the algebra notices.  Gamma[k,t,a], c[t,a] and L^[a] simply repeat across
+the N_s columns of a dendrite -- at N_d = 1 the D triangular solves collapse into
+one, which is the row-constant case the note writes out beside eq. (29) -- while
+Theta does not repeat, so R still differs column by column.  The saving is left on
+the table: D solves of a system that is N_s-fold degenerate cost nothing here worth
+a special case.
+
+What the coarsening does move is the ensemble.  Everything this file reduces over
+the column axis -- the spread of Gamma, the loss, the residual norm -- is then an
+average over N_d independent draws rather than D, so it gets noisier as the gating
+coarsens even though its mean stays put.  The per-column predictions are untouched.
+
     N     width, synapses per input coordinate
     D     input dimension (the note's d); the D coordinates never mix
     K     stream length, number of tasks
     d_f   read density;  n_f = round(d_f N) ones in every column of every F_t
     d_b   write density; n_b = round(d_b N) ones in every column of every B_t,
           nested inside that task's read set.  Defaults to d_f, the unsplit case.
+    N_d   dendrites per neuron, a whole factor of D.  Defaults to D: one synapse
+          per dendrite, the independent columns this file started with.
 
 Shapes:  v (N,)   F, B (K,N,D)   Theta (K,D)   Gamma (K,K,D)   L (D,K,K)   R (K,D)
 
@@ -78,7 +108,9 @@ next to itself, unless a directory is given on the command line:
 API, with d_b defaulting to d_f everywhere it appears:
 
     counts(N, d_f, d_b)             -> n_f, n_b, with the nesting checked
-    draw(N, D, K, d_f, d_b, seed)   -> v, F, B, Theta, (n_f, n_b)
+    dendrites(D, N_d)               -> N_d, N_s, with the grouping checked
+    draw(N, D, K, d_f, d_b, seed, N_d)
+                                    -> v, F, B, Theta, (n_f, n_b)
     coupling(v, F, B)               -> Gamma (K,K,D), write masses c (K,D)
     obliquity(v, F, B, c)           -> 1 - c/(v'Fv) per (t,a), and one Pi checked
     coupling_spread(Gamma, v, B, c, n_f)
@@ -86,10 +118,11 @@ API, with d_b defaulting to d_f everywhere it appears:
     solve_direct(Gamma, Theta)      -> R (K,D), the whole-stream triangular solve
     run_stream(v, F, B, Theta)      -> R (K,D), final W, fit error, rates C
     integrate_stream(v, F, B, Theta)-> time, loss, inherited residuals
-    compare(N, D, K, d_f, d_b, seeds, flow) -> dict of per-seed arrays
+    compare(N, D, K, d_f, d_b, seeds, flow, N_d) -> dict of per-seed arrays
     summarise(res)                  -> printable mean / s.d. / worst table
-    sweep(param, values, ...)       -> one of N, D, K, d_f, d_b, rho varied
-    split_grid(d_f_values, d_b_values, ...) -> the whole rectangle
+    sweep(param, values, ..., N_d)  -> one of N, D, K, d_f, d_b, rho varied, the
+                                       gating granularity held fixed
+    split_grid(d_f_values, d_b_values, ..., N_d) -> the whole rectangle
     format_grid(grid)               -> the rectangle as tables
     plot_comparison(res), plot_flow(res), plot_split_grid(grid)
 """
@@ -125,31 +158,71 @@ def counts(N, d_f, d_b):
     return n_f, n_b
 
 
-def draw(N, D, K, d_f, d_b=None, seed=0):
+def dendrites(D, N_d=None):
+    """N_d dendrites per neuron and the N_s = D/N_d synapses on each, checked once here.
+
+    A neuron is a row of W and its N_in = D entries are the synapses on it, so how
+    coarse the gate is, is a grouping of the D columns: columns a and a' carry one
+    mask iff a // N_s == a' // N_s, and different dendrites are independent.
+
+        N_d = D       N_s = 1    every column independent -- synaptic gating
+        N_d = 1       N_s = D    one mask for the whole row -- neuronal gating
+        1 < N_d < D              blocks of N_s columns -- dendritic gating
+
+    N_d has to divide D exactly.  A ragged last block would leave one dendrite
+    carrying a different number of synapses from the rest, and d_f would no longer
+    mean one thing across the row, so it is a hard error and not a rounding, in the
+    way that n_f and n_b are roundings.  None means D, the independent columns,
+    which is the default everywhere and is what this code did before N_d existed.
+    """
+    N_d = D if N_d is None else int(N_d)
+    if not 1 <= N_d <= D:
+        raise ValueError(
+            f"N_d={N_d} with D={D}: need 1 <= N_d <= D, from one dendrite carrying "
+            "the whole row (neuronal) to one synapse per dendrite (synaptic)")
+    if D % N_d:
+        raise ValueError(
+            f"N_d={N_d} does not divide D={D}: the dendrites would not all carry the "
+            f"same number of synapses.  Use a factor of D: "
+            f"{[k for k in range(1, D + 1) if D % k == 0]}")
+    return N_d, D // N_d
+
+
+def draw(N, D, K, d_f, d_b=None, seed=0, N_d=None):
     """One realisation: readout, nested masks, teachers.
 
-    Each column of each task gets its own uniform permutation of 0..N-1; the first
-    n_f places in it are read and the first n_b written.  So B sits inside F by
-    construction, every column carries exactly its count, and any two columns
-    belonging to different tasks are independent uniform subsets -- which makes
-    the pairwise overlap d_fb^{kt} = n_f/N exactly for k != t, independent of n_b.
-    This is the independent-mask case, the one the free array (11) is free not to
-    be.
+    Each DENDRITE of each task gets its own uniform permutation of 0..N-1; the first
+    n_f places in it are read and the first n_b written, and the N_s columns on that
+    dendrite are handed the same pair.  So B sits inside F by construction, every
+    column carries exactly its count, and any two columns belonging to different
+    tasks -- or to different dendrites of one task -- are independent uniform
+    subsets, which makes the pairwise overlap d_fb^{kt} = n_f/N exactly for k != t,
+    independent of n_b and of N_d.  This is the independent-mask case, the one the
+    free array (11) is free not to be.
+
+    At N_d = D the repeat is the identity and the draw is the fully independent one,
+    variate for variate.  Below that the draw consumes K N_d N variates rather than
+    K D N, so a seed does not name the same teachers at two granularities; seeds are
+    the sample axis, not a paired control.
 
     The teachers are arbitrary; nothing anywhere uses anything about them.  Unit
     rows just put the loss on a scale where 1 means "output nothing".
     """
     d_b = d_f if d_b is None else d_b
     n_f, n_b = counts(N, d_f, d_b)
+    N_d, N_s = dendrites(D, N_d)
     rng = np.random.default_rng(seed)
 
     v = rng.standard_normal(N)/np.sqrt(N)
     v = v / np.linalg.norm(v)
 
-    # rank[k,a,i] is where synapse i landed in column a of task k's permutation
-    rank = np.argsort(np.argsort(rng.random((K, D, N)), axis=-1), axis=-1)
-    F = np.moveaxis((rank < n_f).astype(float), 1, -1)     # (K, D, N) -> (K, N, D)
-    B = np.moveaxis((rank < n_b).astype(float), 1, -1)
+    # rank[k,g,i] is where synapse i landed in DENDRITE g of task k's permutation;
+    # the repeat hands each dendrite's mask to the N_s columns sitting on it, so
+    # column a takes dendrite a // N_s.  N_s = 1 makes the repeat the identity.
+    rank = np.argsort(np.argsort(rng.random((K, N_d, N)), axis=-1), axis=-1)
+    F = np.repeat(np.moveaxis((rank < n_f).astype(float), 1, -1),  # (K,N_d,N)
+                  N_s, axis=-1)                                    # -> (K, N, D)
+    B = np.repeat(np.moveaxis((rank < n_b).astype(float), 1, -1), N_s, axis=-1)
 
     Theta = rng.standard_normal((K, D))
     Theta = Theta / np.linalg.norm(Theta, axis=1, keepdims=True)
@@ -219,6 +292,11 @@ def coupling_spread(Gamma, v, B, c, n_f):
     the bracket being the sampling-without-replacement correction.  With near-flat
     weights sum p_i^2 is about 1/n_b, so the spread falls like 1/sqrt(n_b): the
     split does not move the coupling, it only makes it noisier.
+
+    Both statements are per (t,a) and neither notices N_d.  What N_d moves is the
+    MEASUREMENT: at N_d < D each distinct value of Gamma[k,t,.] appears N_s times in
+    the sample below, so the mean and the s.d. are still unbiased but carry N_d
+    independent columns rather than D.
     """
     K = Gamma.shape[0]
     N = v.size
@@ -400,7 +478,7 @@ def integrate_stream(v, F, B, Theta, per_task=PER_TASK, decay=DECAY,
 
 # ------------------------------------------------------ the comparison itself
 
-def compare(N, D, K, d_f, d_b=None, seeds=range(20), flow=True):
+def compare(N, D, K, d_f, d_b=None, seeds=range(20), flow=True, N_d=None):
     """The two routes, on `len(seeds)` independent realisations, at one (d_f, d_b).
 
     Returns per-seed arrays so the statistics can be done downstream however you
@@ -431,6 +509,7 @@ def compare(N, D, K, d_f, d_b=None, seeds=range(20), flow=True):
     """
     d_b = d_f if d_b is None else d_b
     n_f, n_b = counts(N, d_f, d_b)
+    N_d, N_s = dendrites(D, N_d)
     seeds = list(seeds)
     keys = ("gap", "gap_rel", "gap_amp", "fit", "amp", "diag", "resid", "loss",
             "gam_mean", "gam_sd", "gam_sd_pred", "obliq", "idem")
@@ -440,7 +519,7 @@ def compare(N, D, K, d_f, d_b=None, seeds=range(20), flow=True):
     eps = np.finfo(float).eps
 
     for j, seed in enumerate(seeds):
-        v, F, B, Theta, _ = draw(N, D, K, d_f, d_b, seed)
+        v, F, B, Theta, _ = draw(N, D, K, d_f, d_b, seed, N_d=N_d)
         Gamma, c = coupling(v, F, B)
 
         R_direct = solve_direct(Gamma, Theta)
@@ -503,17 +582,42 @@ def compare(N, D, K, d_f, d_b=None, seeds=range(20), flow=True):
     out["N"], out["D"], out["K"] = N, D, K
     out["d_f"], out["d_b"] = d_f, d_b
     out["n_f"], out["n_b"] = n_f, n_b
+    out["N_d"], out["N_s"] = N_d, N_s
     out["d_f_realised"], out["d_b_realised"] = n_f / N, n_b / N
     out["rho"] = n_f / n_b
     return out
 
 
+def gating_name(N_d, D):
+    """What to call a grouping of D columns into N_d dendrites."""
+    return "synaptic" if N_d == D else "neuronal" if N_d == 1 else "dendritic"
+
+
+def gating_lines(N_d, N_s, D, indent="  "):
+    """The granularity in words, and what it does to every average taken over D."""
+    out = [f"{indent}the gating is {N_d} dendrite{'' if N_d == 1 else 's'} of "
+           f"{N_s} synapse{'' if N_s == 1 else 's'} per neuron "
+           f"({gating_name(N_d, D)}):"]
+    if N_d == D:
+        out.append(f"{indent}  every column carries its own mask, so the column "
+                   f"averages above have {D} independent terms")
+    else:
+        out.append(f"{indent}  Gamma, c and L repeat across each block of {N_s} "
+                   f"columns, so the column")
+        out.append(f"{indent}  averages above have {N_d} independent term"
+                   f"{'' if N_d == 1 else 's'} and not {D}")
+    return out
+
+
 def header(res):
-    """The one line that says which run this is: the settings, the split, the seeds."""
+    """The one line that says which run this is: the settings, the gating, the seeds."""
     return (f"N={res['N']}  D={res['D']}  K={res['K']}  "
             f"d_f={res['d_f_realised']:.3f} (n_f={res['n_f']})  "
             f"d_b={res['d_b_realised']:.3f} (n_b={res['n_b']})  "
-            f"rho={res['rho']:.2f}  {len(res['seeds'])} seeds")
+            f"rho={res['rho']:.2f}  "
+            f"N_d={res['N_d']} (N_s={res['N_s']}, "
+            f"{gating_name(res['N_d'], res['D'])})  "
+            f"{len(res['seeds'])} seeds")
 
 
 def summarise(res):
@@ -546,6 +650,7 @@ def summarise(res):
     lines.append(f"  the coupling should sit at d_f = {res['d_f_realised']:.3f} "
                  f"whatever d_b is, and the obliquity at 1 - 1/rho = "
                  f"{1.0 - 1.0 / res['rho']:.3f}")
+    lines.extend(gating_lines(res["N_d"], res["N_s"], res["D"]))
     if "flow_gap" in res:
         lines.append(
             f"  seed {res['flow_seed']} integrated: curve within {res['flow_gap']:.2e} "
@@ -559,13 +664,18 @@ def summarise(res):
 # ---------------------------------------------------------------- the sweeps
 
 def sweep(param, values, N=200, D=8, K=24, d_f=0.4, d_b=None, seeds=range(10),
-          flow=False):
+          flow=False, N_d=None):
     """Repeat the comparison while one of N, D, K, d_f, d_b, rho varies.
 
     `rho` is the split ratio: the value given is d_f/d_b, so d_b = d_f/rho and the
     read mask is held fixed while the write pool is thinned.  Sweeping `d_b` does
     the same thing in the other parametrisation.  Rounding to the 1/N grid happens
     in `counts`, so ask for rho values the width can actually represent.
+
+    `N_d` is held fixed across the sweep, not varied: it is the gating granularity,
+    and the point of a sweep is to move one thing.  Sweeping `D` with an explicit
+    N_d therefore fails on the first value D is not a multiple of, which is the
+    honest outcome -- N_d = 3 does not mean the same gate at D = 6 and at D = 8.
 
     Returns the values and, for each, the per-seed mean and worst of every
     quantity `compare` produces, plus the realised densities.
@@ -580,7 +690,7 @@ def sweep(param, values, N=200, D=8, K=24, d_f=0.4, d_b=None, seeds=range(10),
         out[k + "_max"] = np.empty(len(values))
     out["rho_realised"] = np.empty(len(values))
 
-    base = dict(N=N, D=D, K=K, d_f=d_f, d_b=d_f if d_b is None else d_b)
+    base = dict(N=N, D=D, K=K, d_f=d_f, d_b=d_f if d_b is None else d_b, N_d=N_d)
     for i, val in enumerate(values):
         kw = dict(base)
         if param == "rho":
@@ -601,7 +711,7 @@ def sweep(param, values, N=200, D=8, K=24, d_f=0.4, d_b=None, seeds=range(10),
     return out
 
 
-def split_grid(d_f_values, d_b_values, N=40, D=4, K=20, seeds=range(8)):
+def split_grid(d_f_values, d_b_values, N=40, D=4, K=20, seeds=range(8), N_d=None):
     """The whole (d_f, d_b) rectangle, skipping the cells the nesting forbids.
 
     Every combination with d_b <= d_f and n_b >= 1 is run; the rest come back NaN.
@@ -619,6 +729,7 @@ def split_grid(d_f_values, d_b_values, N=40, D=4, K=20, seeds=range(8)):
     out["d_f_values"] = np.asarray(d_f_values, dtype=float)
     out["d_b_values"] = np.asarray(d_b_values, dtype=float)
     out["N"], out["D"], out["K"], out["seeds"] = N, D, K, list(seeds)
+    out["N_d"], out["N_s"] = dendrites(D, N_d)
 
     for i, d_f in enumerate(d_f_values):
         for j, d_b in enumerate(d_b_values):
@@ -626,7 +737,7 @@ def split_grid(d_f_values, d_b_values, N=40, D=4, K=20, seeds=range(8)):
                 counts(N, d_f, d_b)
             except ValueError:
                 continue
-            res = compare(N, D, K, d_f, d_b, seeds=seeds, flow=False)
+            res = compare(N, D, K, d_f, d_b, seeds=seeds, flow=False, N_d=N_d)
             out["gap"][i, j] = res["gap"].mean()
             out["gap_max"][i, j] = res["gap"].max()
             out["gap_amp_max"][i, j] = res["gap_amp"].max()
@@ -659,6 +770,7 @@ def format_grid(grid):
               ("mean loss at end of stream", grid["loss"]))
 
     lines = [f"the (d_f, d_b) grid   N={grid['N']}  D={grid['D']}  K={grid['K']}  "
+             f"N_d={grid['N_d']} ({gating_name(grid['N_d'], grid['D'])})  "
              f"{len(grid['seeds'])} seeds;  blank where the nesting forbids the cell",
              "-" * 78]
     for title, table in panels:
@@ -806,7 +918,7 @@ def plot_comparison(res, axes=None):
     ax = axes[2]
     Ks = [k for k in (4, 8, 16, 32, 64, 128) if k <= max(32, 4 * res["K"])]
     sw = sweep("K", Ks, N=res["N"], D=res["D"], d_f=res["d_f"], d_b=res["d_b"],
-               seeds=res["seeds"][:5])
+               seeds=res["seeds"][:5], N_d=res["N_d"])
     ax.plot(sw["values"], sw["gap_max"] / eps, marker="o", color=ORANGE,
             label=r"worst gap / $\epsilon$")
     ax.plot(sw["values"], sw["amp_max"], marker="s", markerfacecolor="none",
