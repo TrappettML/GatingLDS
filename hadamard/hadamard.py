@@ -143,7 +143,7 @@ def draw(N, D, K, d_f, d_b=None, seed=0):
     n_f, n_b = counts(N, d_f, d_b)
     rng = np.random.default_rng(seed)
 
-    v = rng.standard_normal(N)
+    v = rng.standard_normal(N)/np.sqrt(N)
     v = v / np.linalg.norm(v)
 
     # rank[k,a,i] is where synapse i landed in column a of task k's permutation
@@ -177,7 +177,7 @@ def coupling(v, F, B):
     if np.any(c <= 0):
         raise ValueError("a write column is empty; the coupling is undefined there")
     num = np.einsum("i,kia,tia->kta", w, F, B, optimize=True)
-    return num / c[None, :, :], c
+    return np.clip(num / c[None, :, :], 0.0, 1.0), c
 
 
 def obliquity(v, F, B, c):
@@ -1040,13 +1040,13 @@ def run_all(configs, seeds=range(20), outdir=None, stem="split_gating_check",
 
 # one read density, three write densities under it: the unsplit case and two
 # thinnings of it.  Everything else is held fixed, so the rows differ only in rho.
-CONFIGS = (dict(N=40, D=4, K=20, d_f=0.50, d_b=0.50),      # rho = 1
-           dict(N=40, D=4, K=20, d_f=0.50, d_b=0.25),      # rho = 2
-           dict(N=40, D=4, K=20, d_f=0.50, d_b=0.10))      # rho = 5
+CONFIGS = (dict(N=20, D=4, K=40, d_f=0.50, d_b=0.50),      # rho = 1
+           dict(N=20, D=4, K=40, d_f=0.50, d_b=0.25),      # rho = 2
+           dict(N=20, D=4, K=40, d_f=0.50, d_b=0.10))      # rho = 5
 
 GRID = dict(d_f_values=(0.2, 0.4, 0.8),
             d_b_values=(0.025, 0.05, 0.1, 0.2, 0.4, 0.8),
-            N=40, D=4, K=20, seeds=range(8))
+            N=40, D=4, K=200, seeds=range(8))
 
 if __name__ == "__main__":
     run_all(CONFIGS, seeds=range(20), grid=GRID,
