@@ -12,26 +12,36 @@ One gate pair per task serves the whole network, so the write mass c_t = v^T B_t
 is a scalar, the coupling Gamma_kt is a scalar, and the whole stream is one
 triangular system of size K with the D columns of Theta as right-hand sides.
 
-The quantity every figure reports is the residual itself, nothing built on top of it:
+Two scores, both the raw residual -- no normalising, no squaring, no ratio:
 
-    transfer    r_t          = theta_t - thetahat_t^(t-1)           eq. (12)
-    retention   r_t^(Delta)  = theta_t - thetahat_t^(t+Delta)       eq. (28)
+    transfer(K)    ||r_K||,  r_K = theta_K - thetahat_K^(K-1)       eq. (12)
 
-both as ||r|| / ||theta_t||, which is dimensionless and needs no baseline of its
-own: ||r|| = 0 is a solved task and ||r|| = 1 is a state worth no more than W = 0,
-since thetahat = 0 there.  Above 1 the state is worse than not having trained.
+        the task that arrives at step K, read out of the state just before it
+        trains: what the stream has left for it before it does any work of its own
 
-    python3 neuronal_curves.py            # self-test, then all four figures
+    retention(K)   (1/K) sum_{i=1}^{K} ||r_i^(K)||,
+                   r_i^(K) = theta_i - thetahat_i^(K)               eq. (28)
+
+        every task trained so far, read out of the current state, averaged.  There
+        is no lag to choose: the average runs over all the lags the stream has had
+        time to produce, K-1 down to 0.
+
+Teacher rows are drawn on the unit sphere, so both scores sit on a scale where 0 is
+a solved task and 1 is a state worth no more than W = 0, at which thetahat = 0.
+
+    python3 neuronal_curves.py            # self-test, then all five figures
     python3 neuronal_curves.py --test     # the self-test alone
-    python3 neuronal_curves.py 1 3        # only figures 1 and 3
+    python3 neuronal_curves.py 1 4        # only figures 1 and 4
 
 Figures written next to this file:
 
-    fig1_flow.png       the stream as it actually runs: integrated gradient flow
-                        against the two closed forms, eq. (16) and eq. (27)
-    fig2_vs_tasks.png   residual against task index, one trace per density
-    fig3_vs_density.png residual against read density, one trace per split ratio
-    fig4_heatmaps.png   density x splitness, three snapshots of one run to T = 1000
+    fig1_flow.png         the stream as it actually runs: integrated gradient flow
+                          against the two closed forms, eq. (16) and eq. (27)
+    fig2_vs_tasks.png     against task index, one trace per density, d_f = d_b
+    fig3_vs_tasks_split.png   against task index, one row per density, one trace
+                          per split ratio
+    fig4_vs_density.png   against read density, one trace per split ratio
+    fig5_heatmaps.png     density x splitness, three snapshots of one run
 """
 
 import sys
@@ -49,9 +59,6 @@ CONFIG = dict(
     D=12,            # N_in: input dimension.  The D coordinates share one gate and
                      #      differ only in what drives them
     SEEDS=20,        # independent draws (readout, gates, teachers) per point
-    LAG_PAD=5,       # retention lag Delta = round(N / n_b) + LAG_PAD: the task is
-                     #      read out just past the point where the write pool has
-                     #      been turned over once
 
     # --- figure 1, the flow ------------------------------------------------
     K_FLOW=16,       # tasks drawn out in flow time
@@ -63,24 +70,33 @@ CONFIG = dict(
     SUBSTEPS=4,      # integrator steps between two recorded points, at least
     MAX_RATE_STEP=0.1,   # ceiling on c_t dtau
 
-    # --- figure 2, residual against task index -----------------------------
+    # --- figures 2 and 3, against task index -------------------------------
     K_TASKS=5000,    # stream length
-    DENSITIES=(0.5, 0.3, 0.2, 0.1),   # d_f = d_b, one trace each
-    N_BINS_DECADE=12,  # logarithmic bins of anchors per decade.  Every anchor of
-                     #   the stream is measured; a point is the geometric mean
-                     #   over its bin and over the draws
+    DENSITIES=(0.5, 0.3, 0.2, 0.1),   # figure 2: d_f = d_b, one trace each
+    SPLIT_DENSITIES=(0.5, 0.3, 0.2),  # figure 3: one row each
+    SPLIT_RHOS=(1.0, 2.0, 5.0),       # figure 3: one trace each
+    FIG3_FLOOR=1e-2,  # figure 3's y-limits.  the split ratio 5 runs to 1e86 by the
+    FIG3_CEIL=1e6,    #   end of the stream, and letting the axis follow it would
+                      #   flatten the other two traces into one line, so the axis
+                      #   stops here and a clipped trace is labelled with where it
+                      #   actually ended
+    N_POINTS_DECADE=12,   # states sampled per decade of the logarithmic axis.
+                     #      retention is evaluated exactly at those states;
+                     #      transfer is the geometric mean over the interval
+                     #      ending at each of them
 
-    # --- figure 3, residual against density --------------------------------
-    K_DENSITY=1500,  # stream length; the residual is pooled over the second half
+    # --- figure 4, against density -----------------------------------------
+    K_DENSITY=1500,  # stream length; both scores are read at the end of it
     RHOS=(1.0, 2.0, 3.0),             # d_f / d_b, one trace each
     DF_STEP=0.05,    # read-density grid, from D/N to 1.0
+    DENSITY_TAIL=0.25,  # fraction of the stream transfer is pooled over
 
-    # --- figure 4, density against splitness -------------------------------
+    # --- figure 5, density against splitness -------------------------------
     K_HEAT=1000,     # one run per cell; the three columns are snapshots of it
     SNAPSHOTS=(10, 100, 1000),
     HEAT_DF_STEP=0.1,                 # read density, from D/N to 1.0
     HEAT_RHOS=tuple(range(1, 11)),    # splitness 1..10
-    HEAT_WINDOW=0.1, # anchors pooled into a snapshot, as a fraction of k
+    HEAT_WINDOW=0.1, # anchors transfer is pooled over, as a fraction of k
     HEAT_CEIL=2.0,   # colour ceiling in log10||r||: a cell only has to read as
                      #   "a hundred times the baseline or worse".  the .txt keeps
                      #   the unclipped numbers
@@ -154,9 +170,11 @@ def draw(N, D, K, n_f, n_b, seed=0):
     read and the first n_b written, so B_t sits inside F_t by construction and any
     two tasks' gates are independent uniform subsets -- the constant array
     d_fb^{kt} = n_f/N = d_f for k != t, which is the most decorrelated member of
-    the family eq. (9) allows.  Teacher rows are unit vectors, so ||r|| is already
-    the residual relative to the task's own scale and ||r|| = 1 is exactly the
-    null state W = 0.
+    the family eq. (9) allows.
+
+    Teacher rows are drawn on the unit sphere.  That is a property of the ensemble,
+    not a normalisation applied to the scores: the residuals below are reported raw.
+    It is what puts them on a scale where ||r|| = 1 is the null state W = 0.
     """
     rng = np.random.default_rng(seed)
     v = rng.standard_normal(N) / np.sqrt(N)                     # eq. (1)
@@ -168,27 +186,40 @@ def draw(N, D, K, n_f, n_b, seed=0):
     return v, F, B, Theta
 
 
+def rownorm(X):
+    """Euclidean norm of each row, scaled so a large state cannot overflow the square.
+
+    Past the split threshold the state grows like exp(lambda K) and reaches 1e87 at
+    the corner of figure 3.  Squaring that is still finite, but only just, so the
+    rows are scaled by their own largest entry first.
+    """
+    X = np.atleast_2d(X)
+    m = np.abs(X).max(axis=-1)
+    m = np.where(m == 0.0, 1.0, m)
+    return m * np.sqrt(((X / m[:, None]) ** 2).sum(-1))
+
+
 # ============================================================= the stream
 
-def run_stream(v, F, B, Theta, Delta):
-    """Walk the stream once, reading the anchor back at two lags as it goes.
+def run_stream(v, F, B, Theta, eval_states=()):
+    """Walk the stream once, scoring it as it goes.
 
     The update is the endpoint of the within-task flow, eq. (16), so no integration
     is needed: the flow has the fixed left factor B_t v, the state moves on a line,
     and the endpoint is the line's end.  State W^s is the state after s tasks have
     trained, W^0 = 0, and task j (0-based) trains into W^{j+1}.
 
-    Two residuals come back, both as ||r|| / ||theta_j||:
+    Returns
 
-        tr[j]    r_j = theta_j - thetahat_j^(j), eq. (12) -- the task read out of
-                 the state just before it trains, so 1 means the stream has left
-                 nothing useful for it and 0 means it is already solved
-        ret[j]   r_j^(Delta), eq. (28) -- the same task read out of W^{j+1+Delta},
-                 so 0 means it is still solved and 1 means it has been undone
+        tr    (K,)  ||r_t|| for every task, eq. (12): the task read out of the
+                    state just before it trains
+        ret   dict  state s -> (1/s) sum_{i<=s} ||theta_i - v^T F_i W^s||, eq. (28)
+                    averaged over every task the stream has trained so far
 
-    Rows of `ret` with no such state are left as NaN.  Only a rolling window of
-    Delta+1 gates is needed, so the cost is O(K N D) in time and O(N D) in space
-    whatever K is.
+    Retention needs the whole history read out of one state, which is a single
+    (s, N) x (N, D) product, so a state costs O(s N D) and the walk itself costs
+    O(K N D).  Evaluating it at logarithmically spaced states keeps the total
+    within a small multiple of the walk.
     """
     K, N = F.shape
     w = v ** 2
@@ -196,62 +227,21 @@ def run_stream(v, F, B, Theta, Delta):
     if (c <= 0).any():
         raise ValueError("a task has zero write mass; eq. (19) is undefined there")
 
+    Fv = F * v[None, :]
+    Bv = B * v[None, :]
     W = np.zeros((N, Theta.shape[1]))
     tr = np.empty(K)
-    ret = np.full(K, np.nan)
-    norm = np.linalg.norm(Theta, axis=1)
+    ret = {}
+    want = {int(s) for s in eval_states}
 
     for t in range(K):
-        r = Theta[t] - (F[t] * v) @ W                     # eq. (12)
-        tr[t] = np.linalg.norm(r) / norm[t]
-        W += np.outer(B[t] * v, r) / c[t]                 # eq. (16)
-        j = t - Delta
-        if j >= 0:
-            ret[j] = np.linalg.norm(Theta[j] - (F[j] * v) @ W) / norm[j]
-    return tr, ret
-
-
-def run_stream_snapshots(v, F, B, Theta, Delta, snapshots, window):
-    """The same walk, recording only near a few states: figure 4's three columns.
-
-    A snapshot at k is the state W^k.  The transfer reading there is task k-1 read
-    out of W^{k-1} and the retention reading is task k-1-Delta read out of W^k,
-    both pooled over the `window` anchors ending there so that one heavy-tailed
-    draw does not set the cell.  A retention reading needs its anchor to exist, so
-    cells with Delta >= k come back empty rather than as a shorter lag.
-    """
-    K, N = F.shape
-    w = v ** 2
-    c = B @ w
-    W = np.zeros((N, Theta.shape[1]))
-    norm = np.linalg.norm(Theta, axis=1)
-
-    snaps = sorted(int(s) for s in snapshots)
-    want_tr, want_ret = {}, {}
-    for k in snaps:
-        nw = max(1, int(round(window * k)))
-        for j in range(max(0, k - nw), k):                       # transfer anchors
-            want_tr.setdefault(j, []).append(k)
-        for j in range(max(0, k - nw - Delta), k - Delta):       # retention anchors
-            if j >= 0:
-                want_ret.setdefault(j + 1 + Delta, []).append((j, k))
-    out = {k: {"tr": [], "ret": []} for k in snaps}
-
-    for t in range(K):
-        r = Theta[t] - (F[t] * v) @ W
-        if t in want_tr:
-            val = np.linalg.norm(r) / norm[t]
-            for k in want_tr[t]:
-                out[k]["tr"].append(val)
-        W += np.outer(B[t] * v, r) / c[t]
+        r = Theta[t] - Fv[t] @ W                          # eq. (12)
+        tr[t] = float(rownorm(r[None, :])[0])
+        W += np.outer(Bv[t], r) / c[t]                    # eq. (16)
         s = t + 1
-        if s in want_ret:
-            for j, k in want_ret[s]:
-                out[k]["ret"].append(
-                    np.linalg.norm(Theta[j] - (F[j] * v) @ W) / norm[j])
-        if s > max(snaps):
-            break
-    return out
+        if s in want:
+            ret[s] = float(rownorm(Theta[:s] - Fv[:s] @ W).mean())
+    return tr, ret
 
 
 # ================================================= the exact route, eq. (27)
@@ -277,10 +267,15 @@ def solve_stream(Gamma, Theta):
     return R
 
 
-def lagged(Gamma, R, Delta):
-    """R^(Delta) = -U(Delta) R, eq. (30): the first Delta superdiagonals of Gamma."""
-    U = np.triu(Gamma, 1) - np.triu(Gamma, Delta + 1)
-    return -U @ R
+def read_back(Gamma, R, s):
+    """Every task i <= s read out of state s: -sum_{u=i+1}^{s} Gamma_iu r_u, eq. (30).
+
+    The same band operator as eq. (30), taken all the way out to the current state
+    rather than to a fixed lag: row i uses the superdiagonal entries between i and
+    s, so row s is empty and the task just trained comes back solved.
+    """
+    U = np.triu(Gamma[:s, :s], 1)
+    return -U @ R[:s]
 
 
 # ============================================== the mean field, Gamma -> d_f
@@ -294,19 +289,17 @@ def mf_resid(d_f, t, Delta):
 
         r_t          = theta_t - d_f S_{t-1}
         r_t^(Delta)  = -d_f (S_{t+Delta} - S_t)
-                     = -d_f [ (p^Delta - 1) S_t
-                              + sum_{s=t+1}^{t+Delta} p^{t+Delta-s} theta_s ]
 
-    and for teachers that are independent, isotropic and of unit norm the two
-    pieces of the second line are uncorrelated, so
+    and for teachers that are independent, isotropic and of unit norm the pieces of
+    the second line are uncorrelated, so
 
         E||r_t||^2         = 1 + d_f (1 - p^{2(t-1)}) / (2 - d_f)
         E||r_t^(Delta)||^2 = d_f [ (1 - p^{2 Delta})
                                    + (1 - p^Delta)^2 (1 - p^{2t}) ] / (2 - d_f)
 
-    using 1 - p^2 = d_f (2 - d_f).  This returns the square root of those, so that
-    it is in the same units as the measured curves.  `t` is 1-based, as the note
-    counts tasks, and Delta = -1 selects the transfer arm.
+    using 1 - p^2 = d_f (2 - d_f).  This returns the square roots, so that it is in
+    the same units as the measured curves.  `t` is 1-based, as the note counts
+    tasks; Delta = -1 selects the transfer arm; both may be arrays.
 
     Two things it is not.  It is free of the split ratio, because E[Gamma] is:
     everything the split does to the residual lives in second moments and in the
@@ -316,39 +309,50 @@ def mf_resid(d_f, t, Delta):
     (I + L)^{-1} in eq. (27), so ||r||^2 is rational in Gamma and convexity says
     nothing about the composite.  What happens in fact is that the variance of
     Gamma adds to the diagonal of the read-back and the measured residual runs
-    above this curve nearly everywhere -- but "nearly", not "always", and the
-    exceptions are at d_f near 1.
+    above this curve nearly everywhere -- "nearly", not "always", and the
+    exceptions are at d_f near 1, where the calibration point below explains them.
 
-    One calibration point is free.  At d_f = 1 the read gate is the identity, so
+    That calibration point is free.  At d_f = 1 the read gate is the identity, so
     Gamma is exactly the all-ones matrix and nothing is being approximated:
-    r_t = theta_t - theta_{t-1} in the mean field and in the simulation alike.
-    Any gap left there is the estimator and not the physics -- these curves are
-    geometric means while this is a root-mean-square -- and it is worth
-    exp(-1/4D) to leading order: 1.38 against 1.41 at D = 12.
+    r_t = theta_t - theta_{t-1} in the mean field and in the simulation alike.  Any
+    gap left there is the estimator -- these curves are geometric means over draws
+    while this is a root-mean-square -- and it is worth exp(-1/4D) to leading
+    order: 1.38 against 1.41 at D = 12.
     """
     p = 1.0 - d_f
     t = np.asarray(t, dtype=float)
-    if Delta == -1:
-        return np.sqrt(1.0 + d_f * (1.0 - p ** (2 * (t - 1))) / (2.0 - d_f))
-    if Delta < 0:
-        raise ValueError(f"Delta={Delta}: only -1 and Delta >= 0 are defined here")
-    return np.sqrt(d_f * ((1.0 - p ** (2 * Delta))
-                          + (1.0 - p ** Delta) ** 2 * (1.0 - p ** (2 * t)))
-                   / (2.0 - d_f))
+    Delta = np.asarray(Delta, dtype=float)
+    lag = np.maximum(Delta, 0.0)
+    second = np.where(
+        Delta < 0,
+        1.0 + d_f * (1.0 - p ** (2.0 * (t - 1.0))) / (2.0 - d_f),
+        d_f * ((1.0 - p ** (2.0 * lag))
+               + (1.0 - p ** lag) ** 2 * (1.0 - p ** (2.0 * t))) / (2.0 - d_f))
+    return np.sqrt(np.maximum(second, 0.0))
 
 
-def retention_lag(N, n_b, pad):
-    """Delta = round(N / n_b) + pad: one turnover of the write pool, plus a little."""
-    return int(round(N / n_b)) + int(pad)
+def mf_retention(d_f, K):
+    """The mean field's retention score at state K: the same average, term by term.
+
+    (1/K) sum_{i=1}^{K} of the root-mean-square residual of task i read out of
+    state K, which is `mf_resid` at t = i and Delta = K - i.  The i = K term is
+    zero -- the task just trained is solved -- so the average starts at 0 and
+    climbs as the stream fills with older tasks.
+    """
+    K = int(K)
+    i = np.arange(1, K + 1, dtype=float)
+    return float(mf_resid(d_f, i, K - i).mean())
 
 
 def geo(x):
-    """Geometric mean of ||r|| over draws and anchors, the way this file aggregates.
+    """Geometric mean over draws, the way this file combines realisations.
 
     Once the stream is unstable the residual is heavy-tailed across draws: at
-    rho = 3 a single draw can sit seven orders of magnitude above the rest, so an
+    rho = 5 a single draw can sit sixty orders of magnitude above the rest, so an
     arithmetic mean reports that draw and nothing else.  log||r|| is the
     near-Gaussian variable, so the mean is taken there and exponentiated back.
+    The average *within* a draw -- retention's sum over tasks -- is the plain
+    arithmetic mean the definition asks for.
     """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x) & (x > 0)]
@@ -357,11 +361,11 @@ def geo(x):
     return float(np.exp(np.log(x).mean()))
 
 
-def log_bins(K, per_decade):
-    """Logarithmic bins of 1-based anchor indices, as (lo, hi) half-open pairs."""
+def log_points(K, per_decade):
+    """States to score at, logarithmically spaced over 1..K, no repeats."""
     n = max(2, int(round(np.log10(K) * per_decade)) + 1)
-    edges = np.unique(np.round(np.logspace(0.0, np.log10(K + 1), n)).astype(int))
-    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+    pts = np.unique(np.round(np.logspace(0.0, np.log10(K), n)).astype(int))
+    return pts[(pts >= 1) & (pts <= K)]
 
 
 def _end_labels(ax, items, gap=0.055):
@@ -413,9 +417,20 @@ def _chrome(ax):
     ax.set_facecolor(SURFACE)
 
 
-def _baseline(ax):
+def _baseline(ax, note=True):
     """The line at ||r|| = 1: the state is worth exactly what W = 0 is worth."""
     ax.axhline(1.0, color=AXIS, linewidth=1.0, zorder=1)
+    if note:
+        ax.annotate("$1$ = no better than $W=0$", xy=(0.0, 1.0),
+                    xycoords=("axes fraction", "data"), xytext=(4, 3),
+                    textcoords="offset points", ha="left", fontsize=7.5,
+                    color=MUTED)
+
+
+ARMS = (("ret", r"retention:   $\frac{1}{K}\sum_{i\leq K}\|r_i^{(K)}\|$",
+         "every task trained so far, read out of the current state"),
+        ("tr", r"transfer:   $\|r_K\|$",
+         "the arriving task, read out of the state just before it trains"))
 
 
 # ==================================================================== figure 1
@@ -444,8 +459,7 @@ def flow_case(cfg):
     K = cfg["K_FLOW"]
     n_f, n_b = counts(N, cfg["DF_FLOW"], cfg["RHO_FLOW"])
     v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=cfg["FLOW_SEED"])
-    w = v ** 2
-    c = B @ w
+    c = B @ v ** 2
     per, decay = cfg["PER_TASK"], cfg["DECAY"]
     span = decay / c
     start = np.concatenate([[0.0], np.cumsum(span)[:-1]])
@@ -554,35 +568,38 @@ def fig_flow(cfg, res, path):
     plt.close(fig)
 
 
-# ==================================================================== figure 2
+# ============================================================ figures 2 and 3
 
-def case_vs_tasks(cfg, d_f):
-    """One density, every anchor of a stream of K_TASKS, binned logarithmically.
+def case_vs_tasks(cfg, d_f, rho=1.0, seed0=100):
+    """One (d_f, rho), scored at logarithmically spaced states of a stream of K.
 
-    Every anchor is measured, so a bin near the end of the stream pools hundreds of
-    them; that, and not a longer stream, is what makes the tail of the curve smooth.
+    Retention is evaluated exactly at those states -- it is already an average over
+    every task the stream has trained, so nothing more is pooled within a draw.
+    Transfer is one number per task, so it is pooled over the interval of arrivals
+    ending at each state.  Draws are combined geometrically in both cases.
     """
     N, D, K = cfg["N"], cfg["D"], cfg["K_TASKS"]
-    n_f, n_b = counts(N, d_f, 1.0)                 # d_f = d_b on this figure
-    Delta = retention_lag(N, n_b, cfg["LAG_PAD"])
-    raw = {"tr": [], "ret": []}
+    n_f, n_b = counts(N, d_f, rho)
+    pts = log_points(K, cfg["N_POINTS_DECADE"])
+    ret_raw = np.full((cfg["SEEDS"], pts.size), np.nan)
+    tr_raw = np.full((cfg["SEEDS"], pts.size), np.nan)
+    edges = np.concatenate([[0], pts])
     for s in range(cfg["SEEDS"]):
-        v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=100 + s)
-        tr, ret = run_stream(v, F, B, Theta, Delta)
-        raw["tr"].append(tr)
-        raw["ret"].append(ret)
-    stack = {k: np.vstack(a) for k, a in raw.items()}            # (seeds, K)
+        v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=seed0 + s)
+        tr, ret = run_stream(v, F, B, Theta, pts)
+        ret_raw[s] = [ret[int(k)] for k in pts]
+        for q in range(pts.size):
+            tr_raw[s, q] = geo(tr[edges[q]:edges[q + 1]])
+    return dict(x=pts.astype(float), n_b=n_b,
+                ret=np.array([geo(ret_raw[:, q]) for q in range(pts.size)]),
+                tr=np.array([geo(tr_raw[:, q]) for q in range(pts.size)]))
 
-    out = {"tr": [], "ret": [], "centre": []}
-    for a, b in log_bins(K, cfg["N_BINS_DECADE"]):
-        idx = np.arange(a, b)                                    # 1-based anchors
-        out["centre"].append(float(np.exp(np.log(idx).mean())))
-        for k in ("tr", "ret"):
-            out[k].append(geo(stack[k][:, idx - 1]))
-    out = {k: np.array(x) for k, x in out.items()}
-    out["Delta"], out["n_b"] = Delta, n_b
-    out["last"] = {k: float(out[k][np.isfinite(out[k])][-1]) for k in ("tr", "ret")}
-    return out
+
+def _tasks_panel(ax, arm, x, y, colour, label=None):
+    ok = np.isfinite(y) & (y > 0)
+    ln, = ax.plot(x[ok], y[ok], color=colour, linewidth=1.8, zorder=3,
+                  solid_capstyle="round", label=label)
+    return ln, (x[ok][-1], y[ok][-1]) if ok.any() else None
 
 
 def fig_vs_tasks(cfg, cases, path, solve_gap):
@@ -590,38 +607,28 @@ def fig_vs_tasks(cfg, cases, path, solve_gap):
     from matplotlib.lines import Line2D
 
     fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.0), sharex=True)
-    arms = (("ret", r"retention:   $\|r_t^{(\Delta)}\| / \|\theta_t\|$",
-             "the task read back $\\Delta$ tasks after it trained"),
-            ("tr", r"transfer:   $\|r_t\| / \|\theta_t\|$",
-             "the task read out of the state just before it trains"))
     handles = []
-    for ci, (arm, ylab, sub) in enumerate(arms):
+    for ci, (arm, ylab, sub) in enumerate(ARMS):
         ax = axes[ci]
         ends = []
         for k, d_f in enumerate(cfg["DENSITIES"]):
             res = cases[d_f]
-            Delta = res["Delta"]
-            x, y = res["centre"], res[arm]
-            ok = np.isfinite(y)
-            ln, = ax.plot(x[ok], y[ok], color=SERIES[k], linewidth=1.8,
-                          solid_capstyle="round", zorder=3)
-            th = mf_resid(d_f, x[ok], -1 if arm == "tr" else Delta)
-            ax.plot(x[ok], np.broadcast_to(th, x[ok].shape), color=SERIES[k],
-                    linewidth=1.3, linestyle=(0, (1, 2)), zorder=2)
-            ends.append((x[ok][-1], y[ok][-1], f"{d_f}"))
+            ln, end = _tasks_panel(ax, arm, res["x"], res[arm], SERIES[k],
+                                   f"$d_f=d_b={d_f}$" if ci == 0 else None)
             if ci == 0:
-                ln.set_label(f"$d_f=d_b={d_f}$   ($\\Delta={Delta}$)")
                 handles.append(ln)
+            if end:
+                ends.append((end[0], end[1], f"{d_f}"))
+            th = ([mf_retention(d_f, int(k_)) for k_ in res["x"]] if arm == "ret"
+                  else mf_resid(d_f, res["x"], -1))
+            ax.plot(res["x"], th, color=SERIES[k], linewidth=1.3,
+                    linestyle=(0, (1, 2)), zorder=2)
         ax.set_xscale("log")
         _baseline(ax)
         ax.set_title(sub, fontsize=10, color=INK, pad=8)
         ax.set_ylabel(ylab, fontsize=10, color=INK2)
-        ax.set_xlabel("tasks trained", fontsize=9.5, color=INK2)
+        ax.set_xlabel("tasks trained, $K$", fontsize=9.5, color=INK2)
         _chrome(ax)
-        ax.annotate("$1$ = no better than $W=0$", xy=(0.0, 1.0),
-                    xycoords=("axes fraction", "data"), xytext=(4, 3),
-                    textcoords="offset points", ha="left", fontsize=7.5,
-                    color=MUTED)
         _end_labels(ax, ends)
 
     style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
@@ -629,15 +636,16 @@ def fig_vs_tasks(cfg, cases, path, solve_gap):
                     label="mean field, $\\Gamma\\to d_f$ (r.m.s.)")]
     fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=6,
                loc="upper center", bbox_to_anchor=(0.5, 0.935), labelcolor=INK2)
-    fig.suptitle("the residual, against how far into the stream the task sits   "
+    fig.suptitle("the raw residual, against how far into the stream the task sits   "
                  f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_TASKS']}$, "
                  f"{cfg['SEEDS']} draws;  0 = solved, 1 = no better than $W=0$)",
                  fontsize=11, color=INK, y=0.995)
     fig.text(0.5, 0.012,
-             "solid: the geometric mean of $\\|r\\|$ over each logarithmic bin of anchors "
-             "and over the draws.   dotted: the root-mean-square the mean field\n"
-             "predicts.  it is not a bound -- the residuals depend on $\\Gamma$ themselves, "
-             "through $(I+L)^{-1}$ -- but its variance adds to the read-back,\nso the "
+             "retention is the plain average over every task trained so far, so it "
+             "carries no lag; transfer is pooled geometrically over the arrivals in\n"
+             "each interval.  draws are combined geometrically throughout.  the mean "
+             "field is not a bound -- the residuals depend on $\\Gamma$ themselves,\n"
+             "through $(I+L)^{-1}$ -- but its variance adds to the read-back, so the "
              "measured curve runs above it."
              f"      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
              f"{solve_gap:.1e}",
@@ -647,23 +655,105 @@ def fig_vs_tasks(cfg, cases, path, solve_gap):
     plt.close(fig)
 
 
-# ==================================================================== figure 3
+def fig_vs_tasks_split(cfg, cases, path, solve_gap):
+    """Figure 2's axes again, one row per density, one trace per split ratio.
+
+    The vertical range is capped.  Past the threshold of eq. (40) the state grows
+    like exp(lambda K), so the d_f/d_b = 5 trace ends between 1e61 and 1e86
+    depending on the density; an axis that followed it would compress the other two
+    into a single line.  A trace that leaves the panel is labelled with the decade
+    it actually reached.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    dens = cfg["SPLIT_DENSITIES"]
+    rhos = cfg["SPLIT_RHOS"]
+    lo, hi = cfg["FIG3_FLOOR"], cfg["FIG3_CEIL"]
+    fig, axes = plt.subplots(len(dens), 2, figsize=(12.6, 10.4), sharex=True)
+    handles = []
+    for ri, d_f in enumerate(dens):
+        for ci, (arm, ylab, sub) in enumerate(ARMS):
+            ax = axes[ri][ci]
+            ends = []
+            res = None
+            for k, rho in enumerate(rhos):
+                if (d_f, rho) not in cases:
+                    continue
+                res = cases[(d_f, rho)]
+                x, y = res["x"], res[arm]
+                ok = np.isfinite(y) & (y > 1e-9)
+                ln, = ax.plot(x[ok], y[ok], color=SERIES[k], linewidth=1.8, zorder=3,
+                              solid_capstyle="round",
+                              label=f"$d_f/d_b={rho:g}$" if ri + ci == 0 else None)
+                if ri + ci == 0:
+                    handles.append(ln)
+                if ok.any():
+                    last = float(y[ok][-1])
+                    text = (f"{rho:g}" if last <= hi else
+                            f"{rho:g} $\\to10^{{{int(np.log10(last))}}}$")
+                    ends.append((x[ok][-1], min(last, hi), text))
+            # one dotted curve for the row: the mean field cannot see the split
+            th = np.array([mf_retention(d_f, int(k_)) for k_ in res["x"]]
+                          if arm == "ret" else mf_resid(d_f, res["x"], -1))
+            good = th > 1e-9
+            ax.plot(res["x"][good], th[good], color=MUTED, linewidth=1.3,
+                    linestyle=(0, (1, 2)), zorder=2)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.set_ylim(lo, hi)
+            _baseline(ax, note=(ri == 0))
+            if ri == 0:
+                ax.set_title(sub, fontsize=10, color=INK, pad=8)
+            if ri == len(dens) - 1:
+                ax.set_xlabel("tasks trained, $K$", fontsize=9.5, color=INK2)
+            ax.set_ylabel(f"$d_f={d_f}$\n\n{ylab}" if ci == 0 else ylab,
+                          fontsize=9.5, color=INK2)
+            _chrome(ax)
+            _end_labels(ax, ends, gap=0.075)
+
+    style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
+             Line2D([], [], color=MUTED, lw=1.3, ls=(0, (1, 2)),
+                    label="mean field (r.m.s.), one curve per row")]
+    fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=5,
+               loc="upper center", bbox_to_anchor=(0.5, 0.96), labelcolor=INK2)
+    fig.suptitle("the raw residual against task index, at three read densities   "
+                 f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_TASKS']}$, "
+                 f"{cfg['SEEDS']} draws;  1 = no better than $W=0$)",
+                 fontsize=11, color=INK, y=0.995)
+    fig.text(0.5, 0.008,
+             "the vertical axis stops at $10^{6}$: past the threshold of eq. (40) the "
+             "state grows like $\\exp(\\lambda K)$ and $d_f/d_b=5$ ends between "
+             "$10^{61}$ and $10^{86}$,\nso a trace that leaves the panel is labelled "
+             "with the decade it reached.  the dotted curve is the same in every trace "
+             "of a row, because $E[\\Gamma_{kt}]=d_f$ whatever $d_b$ is."
+             f"\n      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
+             f"{solve_gap:.1e}",
+             ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
+    fig.tight_layout(rect=(0, 0.055, 1, 0.945))
+    fig.savefig(path, dpi=180, facecolor=SURFACE)
+    plt.close(fig)
+
+
+# ==================================================================== figure 4
 
 def case_vs_density(cfg, d_f, rho):
-    """Steady-state residual at one (d_f, rho): the stream's second half, pooled."""
+    """Both scores at the end of a stream of K_DENSITY, at one (d_f, rho).
+
+    Retention is the average over every task the stream trained, read out of the
+    final state.  Transfer is pooled over the arrivals in the last DENSITY_TAIL of
+    the stream, which is where it has settled.
+    """
     N, D, K = cfg["N"], cfg["D"], cfg["K_DENSITY"]
     n_f, n_b = counts(N, d_f, rho)
-    Delta = retention_lag(N, n_b, cfg["LAG_PAD"])
-    lo = K // 2
-    pool = {"tr": [], "ret": []}
+    lo = int(round((1.0 - cfg["DENSITY_TAIL"]) * K))
+    ret_raw, tr_raw = [], []
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=200 + s)
-        tr, ret = run_stream(v, F, B, Theta, Delta)
-        pool["tr"].append(tr[lo:])
-        pool["ret"].append(ret[lo:][np.isfinite(ret[lo:])])
-    out = {k: geo(np.concatenate(x)) for k, x in pool.items()}
-    out["Delta"], out["n_b"], out["t_mid"] = Delta, n_b, 0.75 * K
-    return out
+        tr, ret = run_stream(v, F, B, Theta, (K,))
+        ret_raw.append(ret[K])
+        tr_raw.append(geo(tr[lo:]))
+    return dict(ret=geo(ret_raw), tr=geo(tr_raw), n_b=n_b, K=K)
 
 
 def fig_vs_density(cfg, grid, path, solve_gap):
@@ -671,28 +761,22 @@ def fig_vs_density(cfg, grid, path, solve_gap):
     from matplotlib.lines import Line2D
 
     d_fs = sorted({d for d, _ in grid})
+    K = cfg["K_DENSITY"]
     fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.0), sharex=True)
-    arms = (("ret", r"retention:   $\|r_t^{(\Delta)}\| / \|\theta_t\|$",
-             "read back $\\Delta=\\lceil N/n_b\\rfloor+5$ tasks later"),
-            ("tr", r"transfer:   $\|r_t\| / \|\theta_t\|$",
-             "read out of the state just before the task trains"))
     handles = []
-    for ci, (arm, ylab, sub) in enumerate(arms):
+    for ci, (arm, ylab, sub) in enumerate(ARMS):
         ax = axes[ci]
         ends = []
         for k, rho in enumerate(cfg["RHOS"]):
             xs = [d for d in d_fs if (d, rho) in grid]
             ys = [grid[(d, rho)][arm] for d in xs]
             ln, = ax.plot(xs, ys, color=SERIES[k], linewidth=1.8, zorder=3,
-                          solid_capstyle="round")
-            ends.append((xs[-1], ys[-1], f"{rho:g}"))
+                          solid_capstyle="round",
+                          label=f"$d_f/d_b={rho:g}$" if ci == 0 else None)
             if ci == 0:
-                ln.set_label(f"$d_f/d_b={rho:g}$")
                 handles.append(ln)
-        # the mean field cannot see the split: E[Gamma] = d_f whatever d_b is,
-        # so one dotted curve serves all three traces
-        th = [mf_resid(d, grid[(d, cfg["RHOS"][0])]["t_mid"],
-                       -1 if arm == "tr" else grid[(d, cfg["RHOS"][0])]["Delta"])
+            ends.append((xs[-1], ys[-1], f"{rho:g}"))
+        th = [mf_retention(d, K) if arm == "ret" else float(mf_resid(d, K, -1))
               for d in d_fs]
         ax.plot(d_fs, th, color=MUTED, linewidth=1.4, linestyle=(0, (1, 2)), zorder=2)
         ax.set_yscale("log")
@@ -701,10 +785,6 @@ def fig_vs_density(cfg, grid, path, solve_gap):
         ax.set_ylabel(ylab, fontsize=10, color=INK2)
         ax.set_xlabel("read density $d_f$", fontsize=9.5, color=INK2)
         _chrome(ax)
-        ax.annotate("$1$ = no better than $W=0$", xy=(0.0, 1.0),
-                    xycoords=("axes fraction", "data"), xytext=(4, 3),
-                    textcoords="offset points", ha="left", fontsize=7.5,
-                    color=MUTED)
         _end_labels(ax, ends)
 
     style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
@@ -712,16 +792,15 @@ def fig_vs_density(cfg, grid, path, solve_gap):
                     label="mean field (r.m.s.), one curve for all three")]
     fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=5,
                loc="upper center", bbox_to_anchor=(0.5, 0.935), labelcolor=INK2)
-    fig.suptitle("the residual, against how dense the read gate is   "
-                 f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_DENSITY']}$, "
-                 f"{cfg['SEEDS']} draws, second half of the stream)",
-                 fontsize=11, color=INK, y=0.995)
+    fig.suptitle("the raw residual at the end of the stream, against read density   "
+                 f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={K}$, "
+                 f"{cfg['SEEDS']} draws)", fontsize=11, color=INK, y=0.995)
     fig.text(0.5, 0.012,
              "one dotted curve serves all three ratios: $E[\\Gamma_{kt}]=d_f$ whatever "
-             "$d_b$ is, so everything the split does lives in second moments and in\n"
-             "the stability of eq. (17).   at $d_f=1$ the read gate is the identity, "
-             "$\\Gamma$ is exactly all-ones and the two must agree; the $1.38$ against\n"
-             "$1.41$ left there is the estimator, and the noise floor of the comparison."
+             "$d_b$ is, so everything the split does lives in second moments and in the\n"
+             "stability of eq. (17).   at $d_f=1$ the read gate is the identity, $\\Gamma$ "
+             "is exactly all-ones and the two must agree; the gap left there is the\n"
+             "estimator, $1.38$ against $1.41$, and the noise floor of the comparison."
              f"      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
              f"{solve_gap:.1e}",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
@@ -730,32 +809,37 @@ def fig_vs_density(cfg, grid, path, solve_gap):
     plt.close(fig)
 
 
-# ==================================================================== figure 4
+# ==================================================================== figure 5
 
 def case_heat(cfg, d_f, rho):
-    """One run to K_HEAT at one cell, read at the three snapshots, pooled over draws."""
+    """One run to K_HEAT at one cell, scored at the three snapshots.
+
+    Retention at a snapshot is the average over every task trained by then, so
+    every cell of the grid has one -- there is no lag that can reach back past the
+    start of the stream and no cell to leave blank.
+    """
     N, D, K = cfg["N"], cfg["D"], cfg["K_HEAT"]
     n_f, n_b = counts(N, d_f, rho)
-    Delta = retention_lag(N, n_b, cfg["LAG_PAD"])
-    pool = {k: {"tr": [], "ret": []} for k in cfg["SNAPSHOTS"]}
+    snaps = tuple(int(s) for s in cfg["SNAPSHOTS"])
+    out = {k: {"ret": [], "tr": []} for k in snaps}
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=300 + s)
-        snap = run_stream_snapshots(v, F, B, Theta, Delta, cfg["SNAPSHOTS"],
-                                    cfg["HEAT_WINDOW"])
-        for k in cfg["SNAPSHOTS"]:
-            pool[k]["tr"] += list(snap[k]["tr"])
-            pool[k]["ret"] += list(snap[k]["ret"])
-    return {k: {m: geo(x) for m, x in d.items()} for k, d in pool.items()}, Delta
+        tr, ret = run_stream(v, F, B, Theta, snaps)
+        for k in snaps:
+            nw = max(1, int(round(cfg["HEAT_WINDOW"] * k)))
+            out[k]["ret"].append(ret[k])
+            out[k]["tr"].append(geo(tr[k - nw:k]))
+    return {k: {m: geo(x) for m, x in d.items()} for k, d in out.items()}, n_b
 
 
 def fig_heatmaps(cfg, cells, path):
-    """Two rows, transfer and retention, at three snapshots of one run.
+    """Two rows, retention and transfer, at three snapshots of one run.
 
-    The colour carries $\\log_{10}\\|r\\|$ rather than $\\|r\\|$: across this grid the
-    residual runs from 0.5 to $10^{31}$, which no linear scale shows, and the log
-    has the same zero -- $\\|r\\|=1$, the state worth exactly what $W=0$ is worth --
-    with blue below it and red above.  Both rows share one scale; they are two
-    readings of one run and have to be comparable.
+    The colour carries log10||r|| rather than ||r||: across this grid the residual
+    runs from 0.2 to 1e31, which no linear scale shows, and the log has the same
+    zero -- ||r|| = 1, the state worth exactly what W = 0 is worth -- with blue
+    below it and red above.  Both rows share one scale; they are two readings of
+    one run and have to be comparable.
     """
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
@@ -763,8 +847,8 @@ def fig_heatmaps(cfg, cells, path):
     d_fs = sorted({d for d, _ in cells})
     rhos = list(cfg["HEAT_RHOS"])
     snaps = list(cfg["SNAPSHOTS"])
-    rows = (("tr", r"transfer,  $\log_{10}\|r_t\|$"),
-            ("ret", r"retention,  $\log_{10}\|r_t^{(\Delta)}\|$"))
+    rows = (("ret", r"retention,  $\log_{10}$"),
+            ("tr", r"transfer,  $\log_{10}$"))
 
     planes = {}
     for met, _ in rows:
@@ -779,7 +863,7 @@ def fig_heatmaps(cfg, cells, path):
             planes[(met, k)] = Z
 
     cmap = diverging_cmap()
-    cmap.set_bad((0.0, 0.0, 0.0, 0.0))     # see the hatched axes patch below
+    cmap.set_bad((0.0, 0.0, 0.0, 0.0))
     vals = np.concatenate([planes[(m, k)][np.isfinite(planes[(m, k)])]
                            for m, _ in rows for k in snaps])
     ceil = cfg["HEAT_CEIL"]
@@ -809,13 +893,7 @@ def fig_heatmaps(cfg, cells, path):
                 ax.set_ylabel(f"{title}\n\nread density $d_f$", fontsize=9.5,
                               color=INK2)
             ax.tick_params(colors=MUTED, labelsize=8, length=0)
-            # a cell with no anchor is left blank, and the blank has to be
-            # unmistakable: a neutral fill reads as "landed on the baseline",
-            # which is the one thing it does not mean
             ax.set_facecolor("#f3f2ee")
-            ax.patch.set_hatch("///")
-            ax.patch.set_edgecolor("#cdccc5")
-            ax.patch.set_linewidth(0.0)
             for side in ax.spines:
                 ax.spines[side].set_color(AXIS)
                 ax.spines[side].set_linewidth(0.8)
@@ -831,13 +909,12 @@ def fig_heatmaps(cfg, cells, path):
                  f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $T={cfg['K_HEAT']}$, "
                  f"{cfg['SEEDS']} draws per cell)", fontsize=11, color=INK, y=0.965)
     fig.text(0.5, 0.012,
-             "each cell is the geometric mean of $\\|r\\|$ over the draws and over the "
-             f"anchors in the {cfg['HEAT_WINDOW']:.0%} window ending at $k$.  the scale "
-             f"stops at $10^{{{ceil:g}}}$ and the arrow marks cells past it: at the split "
-             "corner\n$\\|r\\|$ reaches $10^{31}$, which no scale resolves against a band "
-             "of width one.  hatched: the retention lag $\\Delta=\\lceil N/n_b\\rfloor+5$ "
-             "reaches back past the start of the stream,\nso the anchor does not exist.  "
-             "the unclipped numbers are in the .txt.",
+             "retention at $k$ averages every task trained by then, so no cell is "
+             f"missing.  transfer is pooled over the arrivals in the "
+             f"{cfg['HEAT_WINDOW']:.0%} window ending at $k$.\nthe scale stops at "
+             f"$10^{{{ceil:g}}}$ and the arrow marks cells past it: at the split corner "
+             "$\\|r\\|$ reaches $10^{31}$, which no scale resolves against a band of "
+             "width one.\nthe unclipped numbers are in the .txt.",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
     fig.savefig(path, dpi=180, facecolor=SURFACE)
     plt.close(fig)
@@ -846,32 +923,23 @@ def fig_heatmaps(cfg, cells, path):
 # ================================================================== self-test
 
 def solve_check(cfg, d_f=0.3, rho=2.0, seed=11):
-    """The streamed route against the exact triangular solve, eq. (27) and (30).
-
-    Two routes that share no arithmetic: walking the protocol one task at a time,
-    and solving (I+L)R = Theta from the coupling alone with nothing trained.  The
-    number this returns is the relative gap between them, and it is quoted on the
-    figures that rest on the stream.
-    """
+    """The streamed scores against the exact triangular solve, eq. (27) and (30)."""
     N, D, K = cfg["N"], cfg["D"], cfg["K_CHECK"]
     n_f, n_b = counts(N, d_f, rho)
-    Delta = retention_lag(N, n_b, cfg["LAG_PAD"])
+    states = (K // 4, K // 2, K)
     v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=seed)
-    tr, ret = run_stream(v, F, B, Theta, Delta)
+    tr, ret = run_stream(v, F, B, Theta, states)
     G = coupling(v, F, B)
     R = solve_stream(G, Theta)
-    norm = np.linalg.norm(Theta, axis=1)
-    tr_d = np.linalg.norm(R, axis=1) / norm
-    ret_d = np.linalg.norm(lagged(G, R, Delta), axis=1) / norm
-    ok = np.isfinite(ret)
-    return float(max(np.abs(tr - tr_d).max() / tr_d.max(),
-                     np.abs(ret[ok] - ret_d[ok]).max() / ret_d[ok].max()))
+    gap = np.abs(tr - rownorm(R)).max() / rownorm(R).max()
+    for s in states:
+        direct = float(rownorm(read_back(G, R, s)).mean())
+        gap = max(gap, abs(ret[s] - direct) / direct)
+    return float(gap)
 
 
 def self_test(cfg, verbose=True):
-    """Three routes checked against each other, none of which shares code with the
-    others: the stream against eq. (27), the integrated flow against eq. (16), and
-    the mean-field formula against the recursion it came from."""
+    """Routes that share no code, checked against each other."""
     fails = 0
 
     def rep(name, got, tol):
@@ -885,16 +953,24 @@ def self_test(cfg, verbose=True):
     if verbose:
         print("-- the stream against the exact triangular solve --")
     for d_f, rho in ((0.5, 1.0), (0.3, 2.0), (0.2, 3.0)):
-        rep(f"d_f={d_f}, rho={rho}: streamed ||r|| == eq. (27)/(30)",
+        rep(f"d_f={d_f}, rho={rho}: streamed scores == eq. (27)/(30)",
             solve_check(cfg, d_f, rho), 1e-9)
 
     if verbose:
-        print("-- the residual at the two reference states --")
+        print("-- the two scores at their reference states --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 40, 20, 10, seed=5)
-    tr, ret = run_stream(v, F, B, Theta, 3)
-    rep("task 1 inherits W = 0, so ||r_1|| / ||theta_1|| = 1", tr[0] - 1.0, 1e-12)
-    tr0, ret0 = run_stream(v, F, B, Theta, 0)
-    rep("Delta = 0 is a solved task, ||r^(0)|| = 0", ret0[:-1], 1e-12)
+    tr, ret = run_stream(v, F, B, Theta, (1, 2, 40))
+    rep("task 1 inherits W = 0, so ||r_1|| = ||theta_1|| = 1", tr[0] - 1.0, 1e-12)
+    rep("retention(1) = 0: the only task trained is solved", ret[1], 1e-12)
+    # two steps replayed by hand: task 2 is solved, so retention(2) is half of
+    # what is left of task 1
+    W1 = np.outer(B[0] * v, Theta[0]) / float(B[0] @ v ** 2)
+    W2 = W1 + np.outer(B[1] * v, Theta[1] - (F[1] * v) @ W1) / float(B[1] @ v ** 2)
+    rep("retention(2) == ||r_1^(2)|| / 2, hand-replayed",
+        ret[2] - 0.5 * float(rownorm((Theta[0] - (F[0] * v) @ W2)[None, :])[0]),
+        1e-12)
+    rep("the residual is raw: ||theta_t|| == 1, nothing is divided out",
+        np.linalg.norm(Theta, axis=1) - 1.0, 1e-12)
 
     if verbose:
         print("-- the integrated flow against eq. (16) --")
@@ -927,20 +1003,25 @@ def self_test(cfg, verbose=True):
                 else:
                     got = (d_f ** 2 * ((Ss[:, t + Delta - 1]
                                         - Ss[:, t - 1]) ** 2).sum(1)).mean()
-                want = mf_resid(d_f, t, Delta)
+                want = float(mf_resid(d_f, t, Delta))
                 rep(f"  d_f={d_f}, Delta={Delta:3d}, t={t:3d}: ||r|| = {want:.4f}",
                     np.sqrt(got) / want - 1.0, 0.02)
+        # the retention score is the same formula averaged term by term
+        for Ks in (20, 150):
+            per = np.sqrt((d_f ** 2 * ((Ss[:, Ks - 1][:, None, :]
+                                        - Ss[:, :Ks]) ** 2).sum(2)).mean(0))
+            rep(f"  d_f={d_f}, retention({Ks}) = {mf_retention(d_f, Ks):.4f}",
+                per.mean() / mf_retention(d_f, Ks) - 1.0, 0.02)
 
     if verbose:
         print("-- the mean field is exact at d_f = 1, where Gamma is all-ones --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 400, cfg["N"], cfg["N"], seed=9)
-    rep("d_f = 1 gives Gamma == 1 everywhere",
-        coupling(v, F, B) - 1.0, 1e-12)
-    tr, ret = run_stream(v, F, B, Theta, 4)
-    direct = np.linalg.norm(Theta[1:] - Theta[:-1], axis=1)
-    rep("  and r_t == theta_t - theta_{t-1}", tr[1:] - direct, 1e-12)
+    rep("d_f = 1 gives Gamma == 1 everywhere", coupling(v, F, B) - 1.0, 1e-12)
+    tr, ret = run_stream(v, F, B, Theta, (400,))
+    rep("  and r_t == theta_t - theta_{t-1}",
+        tr[1:] - np.linalg.norm(Theta[1:] - Theta[:-1], axis=1), 1e-12)
     rep("  r.m.s. of it == the mean field, sqrt(2)",
-        np.sqrt((tr[1:] ** 2).mean()) / mf_resid(1.0, 200, -1) - 1.0, 0.04)
+        np.sqrt((tr[1:] ** 2).mean()) / float(mf_resid(1.0, 200, -1)) - 1.0, 0.04)
     rep("  the geometric mean sits below it by exp(-1/4D)",
         geo(tr[1:]) / (np.sqrt(2.0) * np.exp(-1.0 / (4 * cfg["D"]))) - 1.0, 0.02)
 
@@ -948,10 +1029,12 @@ def self_test(cfg, verbose=True):
         print("-- the aggregator --")
     rep("geo() is the exponential of the mean log", geo([1.0, 100.0]) - 10.0, 1e-12)
     rep("geo() drops non-finite entries", geo([4.0, np.inf, np.nan]) - 4.0, 1e-12)
-    bins = log_bins(1000, 12)
-    rep("log_bins tile 1..K exactly once",
-        [bins[0][0] - 1, bins[-1][1] - 1001]
-        + [b[1] - a[0] for a, b in zip(bins[1:], bins[:-1])], 0)
+    pts = log_points(1000, 12)
+    rep("log_points are increasing and inside 1..K",
+        [pts[0] - 1, pts[-1] - 1000, int((np.diff(pts) <= 0).sum())], 0)
+    big = np.array([[1e200, 1e200]])
+    rep("rownorm survives an entry whose square would overflow",
+        rownorm(big)[0] / (1e200 * np.sqrt(2.0)) - 1.0, 1e-12)
 
     if verbose:
         print(f"\n  {'all checks passed' if not fails else str(fails) + ' FAILED'}")
@@ -968,24 +1051,25 @@ def _grid(lo, hi, step):
 
 def main(argv):
     here = Path(__file__).resolve().parent
-    want = {a for a in argv if a in {"1", "2", "3", "4"}}
-    test_only = "--test" in argv
+    want = {a for a in argv if a in {"1", "2", "3", "4", "5"}}
     cfg = CONFIG
 
     print("=" * 76)
     print("  neuronal split gating -- experiments and figures")
     print(f"  N={cfg['N']}  N_in={cfg['D']}  seeds={cfg['SEEDS']}")
     print("=" * 76)
-    if self_test(cfg) and not test_only:
+    if self_test(cfg) and "--test" not in argv:
         print("\n  self-test failed; not drawing anything")
         return 1
-    if test_only:
+    if "--test" in argv:
         return 0
 
     gap = solve_check(cfg)
     lines = [f"stream vs the exact solve (27) at K={cfg['K_CHECK']}: {gap:.3e}",
-             "every number below is the geometric mean of ||r|| / ||theta_t|| over",
-             "draws and anchors.  0 = solved, 1 = no better than W = 0.",
+             "scores are the RAW residual, ||r||, with no normalising and no squaring.",
+             "  transfer(K)  = ||theta_K - thetahat_K^(K-1)||",
+             "  retention(K) = (1/K) sum_{i<=K} ||theta_i - thetahat_i^(K)||",
+             "0 = solved, 1 = no better than W = 0.  draws combined geometrically.",
              ""]
     head = f"{'retention':>14s} {'transfer':>14s}"
 
@@ -999,19 +1083,36 @@ def main(argv):
                   f"stream vs eq. (27) {res['solve_gap']:.2e}", ""]
 
     if not want or "2" in want:
-        print("figure 2: residual against task index ...")
+        print("figure 2: against task index, one trace per density ...")
         cases = {d: case_vs_tasks(cfg, d) for d in cfg["DENSITIES"]}
         fig_vs_tasks(cfg, cases, here / "fig2_vs_tasks.png", gap)
-        lines.append(f"fig2  at the last logarithmic bin (K={cfg['K_TASKS']})")
-        lines.append(f"  {'d_f':>5s} {'n_b':>4s} {'Delta':>6s} " + head)
+        lines.append(f"fig2  at the end of the stream (K={cfg['K_TASKS']})")
+        lines.append(f"  {'d_f':>5s} {'n_b':>4s} " + head)
         for d in cfg["DENSITIES"]:
             r = cases[d]
-            lines.append(f"  {d:5.2f} {r['n_b']:4d} {r['Delta']:6d} "
-                         f"{r['last']['ret']:14.4f} {r['last']['tr']:14.4f}")
+            lines.append(f"  {d:5.2f} {r['n_b']:4d} "
+                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}")
         lines.append("")
 
     if not want or "3" in want:
-        print("figure 3: residual against density ...")
+        print("figure 3: against task index, one trace per split ratio ...")
+        cases = {}
+        for d in cfg["SPLIT_DENSITIES"]:
+            for rho in cfg["SPLIT_RHOS"]:
+                try:
+                    cases[(d, rho)] = case_vs_tasks(cfg, d, rho, seed0=400)
+                except ValueError:
+                    pass
+        fig_vs_tasks_split(cfg, cases, here / "fig3_vs_tasks_split.png", gap)
+        lines.append(f"fig3  at the end of the stream (K={cfg['K_TASKS']})")
+        lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
+        for (d, rho), r in sorted(cases.items()):
+            lines.append(f"  {d:5.2f} {rho:4.1f} {r['n_b']:4d} "
+                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}")
+        lines.append("")
+
+    if not want or "4" in want:
+        print("figure 4: against density ...")
         grid = {}
         for rho in cfg["RHOS"]:
             for d in _grid(cfg["D"] / cfg["N"], 1.0, cfg["DF_STEP"]):
@@ -1019,16 +1120,16 @@ def main(argv):
                     grid[(d, rho)] = case_vs_density(cfg, d, rho)
                 except ValueError:
                     pass
-        fig_vs_density(cfg, grid, here / "fig3_vs_density.png", gap)
-        lines.append("fig3  steady state, second half of the stream")
-        lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} {'Delta':>6s} " + head)
+        fig_vs_density(cfg, grid, here / "fig4_vs_density.png", gap)
+        lines.append(f"fig4  at the end of the stream (K={cfg['K_DENSITY']})")
+        lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
         for (d, rho), r in sorted(grid.items()):
-            lines.append(f"  {d:5.2f} {rho:4.1f} {r['n_b']:4d} {r['Delta']:6d} "
+            lines.append(f"  {d:5.2f} {rho:4.1f} {r['n_b']:4d} "
                          f"{r['ret']:14.4g} {r['tr']:14.4g}")
         lines.append("")
 
-    if not want or "4" in want:
-        print("figure 4: density against splitness ...")
+    if not want or "5" in want:
+        print("figure 5: density against splitness ...")
         cells = {}
         for d in _grid(cfg["D"] / cfg["N"], 1.0, cfg["HEAT_DF_STEP"]):
             for rho in cfg["HEAT_RHOS"]:
@@ -1036,16 +1137,14 @@ def main(argv):
                     cells[(d, rho)] = case_heat(cfg, d, rho)
                 except ValueError:
                     pass
-        fig_heatmaps(cfg, cells, here / "fig4_heatmaps.png")
-        lines.append(f"fig4  {len(cells)} cells, snapshots {cfg['SNAPSHOTS']}, "
-                     f"unclipped (the figure shows log10 of these, capped at "
+        fig_heatmaps(cfg, cells, here / "fig5_heatmaps.png")
+        lines.append(f"fig5  {len(cells)} cells, snapshots {cfg['SNAPSHOTS']}, "
+                     f"unclipped (the figure shows log10, capped at "
                      f"{cfg['HEAT_CEIL']:g})")
-        lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} {'Delta':>6s} "
-                     f"{'k':>6s} " + head)
-        for (d, rho), (snap, Delta) in sorted(cells.items()):
-            n_b = counts(cfg["N"], d, rho)[1]
+        lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} {'k':>6s} " + head)
+        for (d, rho), (snap, n_b) in sorted(cells.items()):
             for k in cfg["SNAPSHOTS"]:
-                lines.append(f"  {d:5.2f} {rho:4d} {n_b:4d} {Delta:6d} {k:6d} "
+                lines.append(f"  {d:5.2f} {rho:4d} {n_b:4d} {k:6d} "
                              f"{snap[k]['ret']:14.4g} {snap[k]['tr']:14.4g}")
         lines.append("")
 
