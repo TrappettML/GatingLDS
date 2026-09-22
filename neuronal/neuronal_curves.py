@@ -82,7 +82,7 @@ import numpy as np
 
 CONFIG = dict(
     # --- the network, shared by every figure -------------------------------
-    N=60,            # N_h: neurons.  The gate opens and closes whole neurons, so
+    N=200,            # N_h: neurons.  The gate opens and closes whole neurons, so
                      #      this is the only width the dynamics sees
     D=12,            # N_in: input dimension.  The D coordinates share one gate and
                      #      differ only in what drives them
