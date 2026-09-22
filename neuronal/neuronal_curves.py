@@ -49,11 +49,20 @@ The third is the size of the weight change itself, in two readings:
         falls like T^{-1/2}, while at d_f = d_b = 1 the sum telescopes exactly and
         ||W^T||_F = 1/||v|| for every T, so disp falls like 1/T.
 
+Figure 8 reads the same weights against the task index rather than averaged over
+the stream: the left panel is the step of eq. (16) that the arriving task itself
+took, ||W^K - W^{K-1}||_F, and the right is the typical weight it left behind,
+
+    <|W^K_ia|>   the mean of |W_ia| over all N x N_in weights, at state K
+
+-- a magnitude, not a norm, so it says how large a single synapse has grown rather
+than how far the state has moved.
+
 Seeds -- independent draws of (readout, gates, teachers) -- are combined
 geometrically, and every figure carries the standard error of that mean, taken in
 logs and shown multiplicatively.
 
-    python3 neuronal_curves.py            # self-test, then all seven figures
+    python3 neuronal_curves.py            # self-test, then all eight figures
     python3 neuronal_curves.py --test     # the self-test alone
     python3 neuronal_curves.py 1 4        # only figures 1 and 4
     python3 neuronal_curves.py --jax 6 7  # the two heavy kernels on a GPU
@@ -62,7 +71,9 @@ Figures written next to this file:
 
     fig1_flow.png         the stream as it actually runs: integrated gradient flow
                           against the two closed forms, eq. (16) and eq. (27)
-    fig2_vs_tasks.png     against task index, one trace per density, d_f = d_b
+    fig2a_vs_tasks.png    the two scores against task index, one trace per
+                          density, d_f = d_b
+    fig2b_vs_split.png    the same at d_f = FIG2B_DF, one trace per split ratio
     fig3_vs_tasks_split.png   against task index, one row per density, one trace
                           per split ratio
     fig4_vs_density.png   against read density, one trace per split ratio
@@ -70,6 +81,14 @@ Figures written next to this file:
     fig6_step.png         the average step, three stream lengths: against density,
                           against splitness, and the two against each other
     fig7_displacement.png the net displacement per task, the same three panels
+    fig8a_weight_vs_tasks.png   figure 2a's axes, carrying the weights instead of
+                          the residual: the step of the arriving task, and the
+                          typical weight it leaves behind
+    fig8b_weight_vs_split.png   the same at d_f = FIG2B_DF, per split ratio
+
+Figures 2 and 8 come in an `a` and a `b`: `a` varies the density at d_f = d_b, `b`
+holds d_f and varies the split ratio over the same three values figure 3 uses.  The
+four share two sweeps between them, so no case is walked or solved twice.
 """
 
 import sys
@@ -113,6 +132,10 @@ CONFIG = dict(
                       #   flatten the other two traces into one line, so the axis
                       #   stops here and a clipped trace is labelled with where it
                       #   actually ended
+    FIG2B_DF=0.5,    # figures 2b and 8b: the density held fixed while the split
+                     #      varies over SPLIT_RHOS, the same three ratios as fig. 3
+    FIG8_FLOOR=1e-3, # figure 8b's y-limits, as FIG3_* are figure 2b's
+    FIG8_CEIL=1e6,
     N_POINTS_DECADE=12,   # states sampled per decade of the logarithmic axis.
                      #      retention is evaluated exactly at those states;
                      #      transfer is the geometric mean over the interval
@@ -336,6 +359,8 @@ def run_stream(v, F, B, Theta, eval_states=()):
                     something the self-test can check rather than assume
         disp  dict  state s -> ||W^s||_F, how far the state has moved from W^0 = 0
                     once the steps have been allowed to cancel
+        wmag  dict  state s -> mean |W^s_ia| over all N x D weights: the typical
+                    size of a weight, not of the state
 
     Retention needs the whole history read out of one state, which is a single
     (s, N) x (N, D) product, so a state costs O(s N D) and the walk itself costs
@@ -353,7 +378,7 @@ def run_stream(v, F, B, Theta, eval_states=()):
     W = np.zeros((N, Theta.shape[1]))
     tr = np.empty(K)
     dw = np.empty(K)
-    ret, disp = {}, {}
+    ret, disp, wmag = {}, {}, {}
     want = {int(s) for s in eval_states}
 
     for t in range(K):
@@ -366,7 +391,8 @@ def run_stream(v, F, B, Theta, eval_states=()):
         if s in want:
             ret[s] = float(rownorm(Theta[:s] - Fv[:s] @ W).mean())
             disp[s] = fro(W)
-    return tr, ret, dw, disp
+            wmag[s] = float(np.abs(W).mean())
+    return tr, ret, dw, disp, wmag
 
 
 # ================================================= the exact route, eq. (27)
@@ -499,14 +525,16 @@ def exact_scores(v, F, B, Theta, eval_states, retention=True):
     R = solve_stream(G, Theta)
     Rn = rownorm(np.asarray(R))
     A = xp.asarray((B * v[None, :]) / c[:, None])         # rows a_t / c_t, eq. (16)
-    ret, disp = {}, {}
+    ret, disp, wmag = {}, {}, {}
     for s_ in eval_states:
         s_ = int(s_)
         if retention:
             ret[s_] = float(rownorm(np.asarray(-(xp.triu(G[:s_, :s_], 1)
                                                  @ R[:s_]))).mean())
-        disp[s_] = fro(np.asarray(A[:s_].T @ R[:s_]))
-    return Rn, ret, Rn / np.sqrt(c), disp
+        Ws = np.asarray(A[:s_].T @ R[:s_])             # W^s, eq. (16) summed
+        disp[s_] = fro(Ws)
+        wmag[s_] = float(np.abs(Ws).mean())
+    return Rn, ret, Rn / np.sqrt(c), disp, wmag
 
 
 # ============================================== the mean field, Gamma -> d_f
@@ -668,6 +696,53 @@ def mf_displacement(d_f, d_b, K):
     return float(np.sqrt(max((1.0 / d_b - 1.0) * diag + tail, 0.0)))
 
 
+def mf_step_at(d_f, d_b, t):
+    """The mean field's step on task t alone: `mf_step` before the average over t.
+
+    Figures 6 and 7 plot the step averaged over the stream; figure 8 plots the step
+    the current task actually took, so it wants the same thing one t at a time.
+    """
+    return np.asarray(mf_resid(d_f, t, -1), dtype=float) / np.sqrt(d_b)
+
+
+def mf_wmag(d_f, d_b, K, N, D):
+    """The mean field's mean |W_ia| at state K: one shape factor times the norm.
+
+    An entry of the state is W_ia = v_i sum_t b^(t)_i r_{t,a}/c_t -- a readout weight
+    times a sum that is near-Gaussian in its own right.  Writing W_ia = v_i g_ia with
+    g independent of v and i.i.d. of variance sigma^2,
+
+        E|W_ia|    = E|v_i| E|g| = sqrt(2/(pi N)) * sqrt(2/pi) sigma
+        E||W||_F^2 = N D E[v_i^2] E[g^2] = D sigma^2      (E[v_i^2] = 1/N)
+
+    so the ratio is free of sigma and of the stream:
+
+        E|W_ia| = (2/pi) ||W||_F / sqrt(N D) .
+
+    The 2/pi and not sqrt(2/pi): the row scale v_i is itself random, so an entry is
+    a scale mixture and its mean absolute value is smaller than that of a Gaussian
+    of the same variance, which would give sqrt(2/pi).
+
+    **The factor is not actually constant, and 2/pi is the calibrated end of its
+    range, not a derivation that holds everywhere.**  Measured off the walk at
+    N = 60, N_in = 12, the ratio mean|W_ia| sqrt(N N_in) / ||W||_F runs
+
+        0.625  0.641   at d_f = d_b = 1,  K = 40, 400   (2/pi   = 0.637)
+        0.721  0.779   at d_f = d_b = 0.1                (sqrt(2/pi) = 0.798)
+
+    -- from the scale mixture up towards the plain Gaussian as the gate thins and
+    the stream lengthens, because a sparse gate writes each row through a different
+    subset of tasks and the common v_i scale stops dominating.  2/pi is chosen
+    because it is exact at d_f = d_b = 1, where the state is rank one,
+    W = v theta^T/||v||^2, and every other curve in this file is exact too; that
+    corner is the note's calibration point.  Everywhere else this reads up to 22%
+    low, which is small beside the factor of 2.7 that `mf_displacement` -- the
+    magnitude being scaled -- is already loose by.  The self-test brackets the
+    measured factor rather than asserting a constant.
+    """
+    return float(2.0 / np.pi * mf_displacement(d_f, d_b, K) / np.sqrt(N * D))
+
+
 def geo_sem(x):
     """Geometric mean over seeds, the standard error of that mean, and the count.
 
@@ -779,6 +854,15 @@ ARMS = (("ret", r"retention:   $\frac{1}{K}\sum_{i\leq K}\|r_i^{(K)}\|$",
          "every task trained so far, read out of the current state"),
         ("tr", r"transfer:   $\|r_K\|$",
          "the arriving task, read out of the state just before it trains"))
+
+# figure 8's pair.  The same two shapes as ARMS -- one quantity belonging to the
+# arriving task, one to the state it leaves behind -- read off the weights instead
+# of the residual.  Unlike ARMS, the mean field for these two does see the split:
+# E[Gamma_kt] = d_f whatever d_b is, but the write mass is d_b itself.
+ARMS_W = (("dw", r"$\|W^K-W^{K-1}\|_F$",
+           "the step the arriving task took, eq. (16)"),
+          ("wm", r"$\langle\,|W^K_{ia}|\,\rangle$",
+           "the typical weight after it trained, over all $N N_{in}$ of them"))
 
 
 # ==================================================================== figure 1
@@ -934,20 +1018,29 @@ def case_vs_tasks(cfg, d_f, rho=1.0, stream=TASKS):
     edges = np.concatenate([[0], pts])
     shape = (cfg["SEEDS"], pts.size)
     raw = {k: np.full(shape, np.nan) for k in
-           ("ret", "tr", "ret_x", "tr_x")}
+           ("ret", "tr", "dw", "wm", "ret_x", "tr_x", "dw_x", "wm_x")}
     gap = 0.0
+
+    def at(d):
+        """A per-state quantity on the evaluated states, in order."""
+        return np.array([d[int(k)] for k in pts])
+
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, stream, s))
-        tr, ret, _, _ = run_stream(v, F, B, Theta, pts)
-        tr_x, ret_x, _, _ = exact_scores(v, F, B, Theta, pts)
-        gap = max(gap, _route_gap(tr, tr_x), _route_gap(
-            np.array([ret[int(k)] for k in pts]),
-            np.array([ret_x[int(k)] for k in pts])))
-        raw["ret"][s] = [ret[int(k)] for k in pts]
-        raw["ret_x"][s] = [ret_x[int(k)] for k in pts]
+        tr, ret, dw, _, wm = run_stream(v, F, B, Theta, pts)
+        tr_x, ret_x, dw_x, _, wm_x = exact_scores(v, F, B, Theta, pts)
+        gap = max(gap, _route_gap(tr, tr_x), _route_gap(dw, dw_x),
+                  _route_gap(at(ret), at(ret_x)), _route_gap(at(wm), at(wm_x)))
+        raw["ret"][s], raw["ret_x"][s] = at(ret), at(ret_x)
+        raw["wm"][s], raw["wm_x"][s] = at(wm), at(wm_x)
+        # the two per-task quantities are one number per arrival, so each is pooled
+        # over the interval of arrivals ending at the state it is plotted against,
+        # exactly as transfer has always been; the two per-state ones are not
         for q in range(pts.size):
             raw["tr"][s, q] = geo(tr[edges[q]:edges[q + 1]])
             raw["tr_x"][s, q] = geo(tr_x[edges[q]:edges[q + 1]])
+            raw["dw"][s, q] = geo(dw[edges[q]:edges[q + 1]])
+            raw["dw_x"][s, q] = geo(dw_x[edges[q]:edges[q + 1]])
     out = {}
     for k, a in raw.items():
         agg = [geo_sem(a[:, q]) for q in range(pts.size)]
@@ -1034,34 +1127,109 @@ def _route_legend(colour=None, err=None):
     return out
 
 
-def _mf_curve(d_f, x, arm):
-    """The mean field on the same abscissa as the measured traces."""
+def _mf_curve(d_f, x, arm, d_b=None, N=None, D=None):
+    """The mean field on the same abscissa as the measured traces.
+
+    `d_b`, `N` and `D` are wanted only by the ARMS_W pair, which is the only one of
+    the four that can tell d_b from d_f.
+    """
     if arm == "ret":
         return np.array([mf_retention(d_f, int(k)) for k in x])
-    return np.asarray(mf_resid(d_f, x, -1), dtype=float)
+    if arm == "tr":
+        return np.asarray(mf_resid(d_f, x, -1), dtype=float)
+    if arm == "dw":
+        return mf_step_at(d_f, d_b, x)
+    return np.array([mf_wmag(d_f, d_b, int(k), N, D) for k in x])
 
 
-def fig_vs_tasks(cfg, cases, path, solve_gap):
+def density_traces(cfg, cases):
+    """The `a` panels: one trace per density, d_f = d_b, as figure 2 always was."""
+    return [(d, f"$d_f=d_b={d}$", f"{d}", d, d)
+            for d in cfg["DENSITIES"] if d in cases]
+
+
+def split_traces(cfg, cases, d_f=None):
+    """The `b` panels: one trace per split ratio at one density, as figure 3's rows.
+
+    The realised write density comes from `counts`, not from d_f/rho: the counts are
+    rounded onto the 1/N grid once and everything downstream uses the realised pair,
+    which is what the mean field for ARMS_W has to be handed.
+    """
+    d_f = cfg["FIG2B_DF"] if d_f is None else d_f
+    out = []
+    for rho in cfg["SPLIT_RHOS"]:
+        if (d_f, rho) in cases:
+            out.append(((d_f, rho), f"$d_f/d_b={rho:g}$", f"{rho:g}",
+                        d_f, cases[(d_f, rho)]["n_b"] / cfg["N"]))
+    if not out:
+        raise ValueError(
+            f"no case at d_f={d_f}: FIG2B_DF has to be one of SPLIT_DENSITIES "
+            f"{tuple(cfg['SPLIT_DENSITIES'])}, which is what the split sweep walks")
+    return out
+
+
+def fig_vs_tasks(cfg, cases, path, arms, traces, title, note, cap=None, ylog=False):
+    """Two panels against task index, one trace per entry of `traces`.
+
+    One function for figures 2a, 2b, 8a and 8b.  `arms` is ARMS or ARMS_W -- which
+    pair of quantities the two panels carry -- and `traces` is
+    [(case_key, legend label, end label, d_f, d_b), ...] in drawing order, so the
+    caller decides whether the traces run over the density or over the split ratio
+    at one density and this function only draws them.
+
+    `cap` is (floor, ceiling) for the panels that need one: past the threshold of
+    eq. (40) a split trace runs to 1e68 by the end of the stream and an axis that
+    followed it would flatten the others into a single line, so the axis stops and a
+    trace that leaves the panel is labelled with the decade it reached.
+
+    The mean field is drawn once per trace when it can tell the traces apart and
+    once for the panel, in secondary ink, when it cannot: for ARMS it cannot, since
+    E[Gamma_kt] = d_f whatever d_b is, so three identical dotted curves would only
+    claim a distinction that is not there.
+    """
     import matplotlib.pyplot as plt
 
+    if not traces:
+        print(f"  no cases for {path.name}; skipped")
+        return
+    if len(traces) > len(SERIES):
+        raise ValueError(
+            f"{len(traces)} traces and {len(SERIES)} categorical slots: the slots "
+            f"are assigned in a fixed order and never cycled, so a fifth trace "
+            f"would repeat a colour.  split the figure instead")
+    blind = arms is ARMS
     fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.0), sharex=True)
     handles = []
-    worst = max(c["gap"] for c in cases.values())
-    for ci, (arm, ylab, sub) in enumerate(ARMS):
+    worst = max(cases[t[0]]["gap"] for t in traces)
+    for ci, (arm, ylab, sub) in enumerate(arms):
         ax = axes[ci]
-        ends = []
-        for k, d_f in enumerate(cfg["DENSITIES"]):
-            res = cases[d_f]
-            ln, end = _three(ax, res["x"], res[arm], res[arm + "_x"],
-                             _mf_curve(d_f, res["x"], arm), SERIES[k],
-                             f"$d_f=d_b={d_f}$" if ci == 0 else None,
+        ends, res = [], None
+        for k, (key, label, tag, d_f, d_b) in enumerate(traces):
+            res = cases[key]
+            mf = None if blind else _mf_curve(d_f, res["x"], arm, d_b,
+                                              cfg["N"], cfg["D"])
+            ln, end = _three(ax, res["x"], res[arm], res[arm + "_x"], mf, SERIES[k],
+                             label if ci == 0 else None,
                              sem=res[arm + "_sem"], err="band")
             if ci == 0:
                 handles.append(ln)
             if end:
-                ends.append((end[0], end[1], f"{d_f}"))
+                over = cap is not None and end[1] > cap[1]
+                ends.append((end[0], min(end[1], cap[1]) if cap else end[1],
+                             f"{tag} $\\to10^{{{int(np.log10(end[1]))}}}$"
+                             if over else tag))
+        if blind:
+            th = _mf_curve(traces[0][3], res["x"], arm)
+            good = np.isfinite(th) & (th > 1e-9)
+            ax.plot(res["x"][good], th[good], color=MUTED, linewidth=1.3,
+                    linestyle=(0, (1, 2)), zorder=2)
         ax.set_xscale("log")
-        _baseline(ax)
+        if ylog or cap:
+            ax.set_yscale("log")
+        if cap:
+            ax.set_ylim(*cap)
+        if arm in ("ret", "tr"):
+            _baseline(ax)
         ax.set_title(sub, fontsize=10, color=INK, pad=8)
         ax.set_ylabel(ylab, fontsize=10, color=INK2)
         ax.set_xlabel("tasks trained, $K$", fontsize=9.5, color=INK2)
@@ -1069,28 +1237,40 @@ def fig_vs_tasks(cfg, cases, path, solve_gap):
         _end_labels(ax, ends)
 
     fig.legend(handles=handles + _route_legend(err="band"), frameon=False,
-               fontsize=8.5, ncol=8, loc="upper center",
+               fontsize=8.5, ncol=len(handles) + 4, loc="upper center",
                bbox_to_anchor=(0.5, 0.935), labelcolor=INK2)
-    fig.suptitle("the raw residual, against how far into the stream the task sits   "
-                 f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_TASKS']}$, "
-                 f"{cfg['SEEDS']} seeds;  0 = solved, 1 = no better than $W=0$)",
+    fig.suptitle(f"{title}   ($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, "
+                 f"$K={cfg['K_TASKS']}$, {cfg['SEEDS']} seeds)",
                  fontsize=11, color=INK, y=0.995)
     fig.text(0.5, 0.012,
              "the dashed line is the closed form on the same seeds -- the coupling "
              "eq. (19), one triangular solve eq. (27) and the band eq. (30), with no "
              "state ever formed.\nit rides inside the solid band because the two are "
-             "the same numbers; here they agree to "
-             f"{worst:.0e} relative, worst case over every point drawn.\n"
-             "the mean field is a different quantity and is not a bound: the residuals "
-             "depend on $\\Gamma$ themselves, through $(I+L)^{-1}$, but its variance "
-             "adds to the read-back, so the measured curve runs above it.",
+             f"the same numbers; here they agree to {worst:.0e} relative, worst case "
+             f"over every point drawn.\n{note}",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
-    fig.tight_layout(rect=(0, 0.125, 1, 0.9))
+    fig.tight_layout(rect=(0, 0.125 + 0.022 * note.count("\n"), 1, 0.9))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
     plt.close(fig)
 
 
-def fig_vs_tasks_split(cfg, cases, path, solve_gap):
+NOTE_SCORE = ("the mean field is a different quantity and is not a bound: the "
+              "residuals depend on $\\Gamma$ themselves, through $(I+L)^{-1}$, but "
+              "its variance adds to the read-back, so the measured curve runs above "
+              "it.")
+NOTE_SCORE_SPLIT = ("one dotted mean field serves all three traces: "
+                    "$E[\\Gamma_{kt}]=d_f$ whatever $d_b$ is, so everything the "
+                    "split does lives in second moments and in the stability of "
+                    "eq. (17).")
+NOTE_WEIGHT = ("the dotted mean field is $\\Gamma\\to d_f$ with the write mass at "
+               "$E[c_t]=d_b\\|v\\|^2$; unlike the residual it does see the split, "
+               "through $1/\\sqrt{d_b}$.\nthe right-hand one carries a further shape "
+               "factor $2/\\pi$ over $\\sqrt{N N_{in}}$, exact only at the rank-one "
+               "corner $d_f=d_b=1$ and up to $22\\%$ low elsewhere,\non top of a "
+               "displacement that is itself loose -- read it as a scale, not a fit.")
+
+
+def fig_vs_tasks_split(cfg, cases, path):
     """Figure 2's axes again, one row per density, one trace per split ratio.
 
     The vertical range is capped.  Past the threshold of eq. (40) the state grows
@@ -1182,8 +1362,8 @@ def case_vs_density(cfg, d_f, rho):
     gap = 0.0
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, DENSITY, s))
-        tr, ret, _, _ = run_stream(v, F, B, Theta, (K,))
-        tr_x, ret_x, _, _ = exact_scores(v, F, B, Theta, (K,))
+        tr, ret, _, _, _ = run_stream(v, F, B, Theta, (K,))
+        tr_x, ret_x, _, _, _ = exact_scores(v, F, B, Theta, (K,))
         gap = max(gap, _route_gap(tr, tr_x),
                   _route_gap([ret[K]], [ret_x[K]]))
         acc["ret"].append(ret[K])
@@ -1197,7 +1377,7 @@ def case_vs_density(cfg, d_f, rho):
     return out
 
 
-def fig_vs_density(cfg, grid, path, solve_gap):
+def fig_vs_density(cfg, grid, path):
     import matplotlib.pyplot as plt
 
     d_fs = sorted({d for d, _ in grid})
@@ -1267,7 +1447,7 @@ def case_heat(cfg, d_f, rho):
     out = {k: {"ret": [], "tr": []} for k in snaps}
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, HEAT, s))
-        tr, ret, _, _ = run_stream(v, F, B, Theta, snaps)
+        tr, ret, _, _, _ = run_stream(v, F, B, Theta, snaps)
         for k in snaps:
             nw = max(1, int(round(cfg["HEAT_WINDOW"] * k)))
             out[k]["ret"].append(ret[k])
@@ -1405,14 +1585,14 @@ def case_delta_w(cfg, d_f, rho, exact=True):
     gap = 0.0
     for sd in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, DELTAW, sd))
-        _, _, dw, disp = run_stream(v, F, B, Theta, snaps)
+        _, _, dw, disp, _ = run_stream(v, F, B, Theta, snaps)
         cum = np.cumsum(dw)
         for t in snaps:
             acc[f"step@{t}"].append(cum[t - 1] / t)
             acc[f"disp@{t}"].append(disp[t] / t)
         if exact:
-            _, _, dw_x, disp_x = exact_scores(v, F, B, Theta, snaps,
-                                              retention=False)
+            _, _, dw_x, disp_x, _ = exact_scores(v, F, B, Theta, snaps,
+                                                 retention=False)
             cum_x = np.cumsum(dw_x)
             gap = max(gap, _route_gap(dw, dw_x),
                       _route_gap([disp[t] for t in snaps],
@@ -1640,12 +1820,13 @@ def solve_check(cfg, d_f=0.3, rho=2.0, index=11):
     n_f, n_b = counts(N, d_f, rho)
     states = (K // 4, K // 2, K)
     v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, TEST, index))
-    tr, ret, dw, disp = run_stream(v, F, B, Theta, states)
-    tr_x, ret_x, dw_x, disp_x = exact_scores(v, F, B, Theta, states)
+    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, states)
+    tr_x, ret_x, dw_x, disp_x, wm_x = exact_scores(v, F, B, Theta, states)
     return max(_route_gap(tr, tr_x),
                _route_gap(dw, dw_x),
                _route_gap([ret[s] for s in states], [ret_x[s] for s in states]),
-               _route_gap([disp[s] for s in states], [disp_x[s] for s in states]))
+               _route_gap([disp[s] for s in states], [disp_x[s] for s in states]),
+               _route_gap([wm[s] for s in states], [wm_x[s] for s in states]))
 
 
 def self_test(cfg, verbose=True):
@@ -1669,7 +1850,7 @@ def self_test(cfg, verbose=True):
     if verbose:
         print("-- the two scores at their reference states --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 40, 20, 10, rng_for(cfg, TEST, 5))
-    tr, ret, dw, disp = run_stream(v, F, B, Theta, (1, 2, 40))
+    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (1, 2, 40))
     rep("task 1 inherits W = 0, so ||r_1|| = ||theta_1|| = 1", tr[0] - 1.0, 1e-12)
     rep("retention(1) = 0: the only task trained is solved", ret[1], 1e-12)
     # two steps replayed by hand: task 2 is solved, so retention(2) is half of
@@ -1729,7 +1910,7 @@ def self_test(cfg, verbose=True):
                           rng_for(cfg, TEST, 9))
     rep("d_f = 1 gives Gamma == 1 everywhere",
         np.asarray(coupling(v, F, B)) - 1.0, 1e-12)
-    tr, ret, dw, disp = run_stream(v, F, B, Theta, (400,))
+    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (400,))
     rep("  and r_t == theta_t - theta_{t-1}",
         tr[1:] - np.linalg.norm(Theta[1:] - Theta[:-1], axis=1), 1e-12)
     rep("  r.m.s. of it == the mean field, sqrt(2)",
@@ -1741,13 +1922,23 @@ def self_test(cfg, verbose=True):
         print("-- the weight change: the step of eq. (16) is rank one --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 120, 24, 12, rng_for(cfg, TEST, 21))
     cw = B @ v ** 2
-    tr, ret, dw, disp = run_stream(v, F, B, Theta, (1, 40, 120))
+    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (1, 40, 120))
     rep("||W^t-W^{t-1}||_F == ||r_t||/sqrt(c_t), eqs. (15) and (16)",
         dw / (tr / np.sqrt(cw)) - 1.0, 1e-12)
     rep("the first step is ||theta_1||/sqrt(c_1), since W^0 = 0",
         dw[0] * np.sqrt(cw[0]) - 1.0, 1e-12)
     rep("the displacement never exceeds the steps that made it",
         max(0.0, (disp[120] - dw.sum()) / dw.sum()), 1e-12)
+    shape = [wm[k] * np.sqrt(cfg["N"] * cfg["D"]) / disp[k] for k in (40, 120)]
+    rep("mean |W_ia| sqrt(N N_in) / ||W||_F sits in [2/pi, sqrt(2/pi)]",
+        [max(0.0, 2.0 / np.pi / 1.05 - f, f - np.sqrt(2.0 / np.pi) * 1.05)
+         for f in shape], 0.0)
+    rep("mf_step is mf_step_at averaged over the stream",
+        mf_step(0.3, 0.1, 50)
+        / mf_step_at(0.3, 0.1, np.arange(1, 51)).mean() - 1.0, 1e-12)
+    rep("mf_wmag is mf_displacement scaled by that same factor",
+        mf_wmag(0.3, 0.1, 50, 60, 12) * np.pi / 2.0 * np.sqrt(60 * 12)
+        / mf_displacement(0.3, 0.1, 50) - 1.0, 1e-12)
     G = coupling(v, F, B)
     R = np.asarray(solve_stream(G, Theta))
     rep("the solve is causal: rows <= k of the K-solve are the k-solve",
@@ -1766,7 +1957,7 @@ def self_test(cfg, verbose=True):
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 200, cfg["N"], cfg["N"],
                           rng_for(cfg, TEST, 22))
     nv = float(np.linalg.norm(v))
-    tr, ret, dw, disp = run_stream(v, F, B, Theta, (100, 200))
+    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (100, 200))
     rep("  ||W^t||_F == 1/||v|| for every t: sum_{s<=t} r_s = theta_t",
         [disp[s] * nv - 1.0 for s in (100, 200)], 1e-12)
     rep("  and the step is ||theta_t - theta_{t-1}|| / ||v||",
@@ -1775,6 +1966,16 @@ def self_test(cfg, verbose=True):
         [mf_displacement(1.0, 1.0, T) - 1.0 for T in (100, 200)], 1e-12)
     rep("  mf_step(1, 1, T) == the measured step, bar the estimator gap",
         dw.mean() * nv / mf_step(1.0, 1.0, 200) - 1.0, 0.05)
+    # over seeds, not on one: W = v theta_K^T/||v||^2 there, so a single seed's
+    # mean|W_ia| carries the fluctuation of mean_a|theta_a| over N_in = 12 numbers
+    ratio = []
+    for i in range(8):
+        vv, FF, BB, TT = draw(cfg["N"], cfg["D"], 120, cfg["N"], cfg["N"],
+                              rng_for(cfg, TEST, 40 + i))
+        _, _, _, dp, wmg = run_stream(vv, FF, BB, TT, (120,))
+        ratio.append(wmg[120] * np.sqrt(cfg["N"] * cfg["D"]) / dp[120])
+    rep("  and the shape factor is 2/pi there, where W is rank one",
+        float(np.mean(ratio)) / (2.0 / np.pi) - 1.0, 0.05)
 
     if verbose:
         print("-- the weight-change mean field against its own recursion --")
@@ -1828,6 +2029,44 @@ def self_test(cfg, verbose=True):
             1e-12)
 
     if verbose:
+        print("-- one figure-2/8 case against a replay of the same seeds --")
+    # all four arms at once, which pins the two conventions figure 8 rests on: the
+    # per-task pair is pooled over the interval of arrivals ending at each state and
+    # the per-state pair is read at the state itself, after the task has trained
+    small = {**cfg, "K_TASKS": 60, "N_POINTS_DECADE": 2, "SEEDS": 2}
+    res = case_vs_tasks(small, 0.3)
+    pts = log_points(small["K_TASKS"], small["N_POINTS_DECADE"])
+    edges = np.concatenate([[0], pts])
+    n_f, n_b = counts(cfg["N"], 0.3, 1.0)
+    arms = ("tr", "dw", "ret", "wm")
+    hand = {k: [[] for _ in pts] for k in arms}
+    for sd in range(small["SEEDS"]):
+        v, F, B, Theta = draw(cfg["N"], cfg["D"], small["K_TASKS"], n_f, n_b,
+                              rng_for(small, TASKS, sd))
+        W = np.zeros((cfg["N"], cfg["D"]))
+        cw = B @ v ** 2
+        tr_, dw_, state = [], [], {}
+        for t in range(small["K_TASKS"]):
+            r = Theta[t] - (F[t] * v) @ W
+            tr_.append(float(np.linalg.norm(r)))
+            stp = np.outer(B[t] * v, r) / cw[t]
+            dw_.append(float(np.linalg.norm(stp)))
+            W += stp
+            if t + 1 in set(int(p) for p in pts):
+                state[t + 1] = (
+                    float(np.mean([np.linalg.norm(Theta[i] - (F[i] * v) @ W)
+                                   for i in range(t + 1)])),
+                    float(np.abs(W).mean()))
+        for q, p in enumerate(pts):
+            hand["tr"][q].append(geo(tr_[edges[q]:edges[q + 1]]))
+            hand["dw"][q].append(geo(dw_[edges[q]:edges[q + 1]]))
+            hand["ret"][q].append(state[int(p)][0])
+            hand["wm"][q].append(state[int(p)][1])
+    for k in arms:
+        rep(f"  {k} == the hand replay, at every one of the {pts.size} points",
+            [res[k][q] / geo(hand[k][q]) - 1.0 for q in range(pts.size)], 1e-12)
+
+    if verbose:
         print("-- the aggregator and the seeds --")
     rep("geo() is the exponential of the mean log", geo([1.0, 100.0]) - 10.0, 1e-12)
     rep("geo() drops non-finite entries", geo([4.0, np.inf, np.nan]) - 4.0, 1e-12)
@@ -1866,9 +2105,23 @@ def self_test(cfg, verbose=True):
 # ======================================================================= main
 
 def _grid(lo, hi, step):
-    """An inclusive grid, rounded, so that 0.2..1.0 by 0.1 has exactly nine points."""
-    n = int(round((hi - lo) / step)) + 1
-    return [round(lo + i * step, 9) for i in range(n)]
+    """An inclusive grid anchored at `hi`, so that d_f = 1 is always on it.
+
+    Anchored at the top and not at the bottom.  The lower end of the density grids
+    is D/N, which is not in general a whole number of steps below 1, and d_f = 1 is
+    the calibration point every caption in this file leans on: the read gate is the
+    identity there, Gamma is exactly all-ones and the mean field is exact rather
+    than approximate.  Anchoring at the bottom drops it whenever 1 - D/N is not a
+    multiple of the step, and worse, walks past 1.0 -- at N = 200, D = 12 the old
+    form ended at 1.01, where `counts` raises and the cell was silently swallowed by
+    the caller's `except ValueError`.  It happened to be right at N = 60, where
+    D/N = 0.2 sits a whole 16 steps below 1.
+
+    0.2..1.0 by 0.1 still has exactly nine points, and every grid this file built at
+    N = 60 or N = 120 is unchanged.
+    """
+    n = int(np.floor((hi - lo) / step + 1e-9)) + 1
+    return [round(hi - i * step, 9) for i in range(n)][::-1]
 
 
 def _write_log(path, lines, want):
@@ -1903,7 +2156,7 @@ def _write_log(path, lines, want):
 
 def main(argv):
     here = Path(__file__).resolve().parent
-    want = {a for a in argv if a in {"1", "2", "3", "4", "5", "6", "7"}}
+    want = {a for a in argv if a in {"1", "2", "3", "4", "5", "6", "7", "8"}}
     cfg = CONFIG
 
     print("=" * 76)
@@ -1935,6 +2188,20 @@ def main(argv):
              ""]
     head = (f"{'retention':>14s} {'transfer':>14s}"
             f"{'ret, eq.27/30':>15s} {'tr, eq.27/30':>15s} {'route gap':>11s}")
+    head_w = (f"{'mean dW':>14s} {'mean |W|':>14s}"
+              f"{'dW, eq.27':>15s} {'|W|, eq.27':>15s} {'route gap':>11s}")
+
+    def rows(sub_cases, keys, arms):
+        """One table: the two arms at the end of the stream, for each trace."""
+        a, b = arms[0][0], arms[1][0]
+        out = []
+        for key, lab in keys:
+            r = sub_cases[key]
+            out.append(f"  {lab:>9s} {r['n_b']:4d} "
+                       f"{r[a][-1]:14.4g} {r[b][-1]:14.4g}"
+                       f"{r[a + '_x'][-1]:15.4g} {r[b + '_x'][-1]:15.4g}"
+                       f"{r['gap']:11.1e}")
+        return out
 
     if not want or "1" in want:
         print("\nfigure 1: the flow ...")
@@ -1945,30 +2212,66 @@ def main(argv):
                   f"integrated residuals vs eq. (27) {res['box_gap']:.2e}  "
                   f"stream vs eq. (27) {res['solve_gap']:.2e}", ""]
 
+    # figures 2a/8a share one sweep and figures 2b/3/8b share another, so each
+    # case is walked and solved once however many of the four are asked for
+    dens, split = {}, {}
+    if not want or (want & {"2", "8"}):
+        print("the density sweep, d_f = d_b (figures 2a and 8a) ...")
+        dens = {d: case_vs_tasks(cfg, d) for d in cfg["DENSITIES"]}
+    if not want or (want & {"2", "3", "8"}):
+        print("the split sweep (figures 2b, 3 and 8b) ...")
+        for d in cfg["SPLIT_DENSITIES"]:
+            for rho in cfg["SPLIT_RHOS"]:
+                try:
+                    split[(d, rho)] = case_vs_tasks(cfg, d, rho, stream=SPLIT)
+                except ValueError:
+                    pass
+
     if not want or "2" in want:
-        print("figure 2: against task index, one trace per density ...")
-        cases = {d: case_vs_tasks(cfg, d) for d in cfg["DENSITIES"]}
-        fig_vs_tasks(cfg, cases, here / "fig2_vs_tasks.png", gap)
+        print("figures 2a and 2b: the residual against task index ...")
+        t_d, t_s = density_traces(cfg, dens), split_traces(cfg, split)
+        fig_vs_tasks(cfg, dens, here / "fig2a_vs_tasks.png", ARMS, t_d,
+                     "the raw residual against task index, one trace per density"
+                     ";  0 = solved, 1 = no better than $W=0$", NOTE_SCORE)
+        fig_vs_tasks(cfg, split, here / "fig2b_vs_split.png", ARMS, t_s,
+                     f"the same at $d_f={cfg['FIG2B_DF']:g}$, one trace per split "
+                     "ratio;  1 = no better than $W=0$", NOTE_SCORE_SPLIT,
+                     cap=(cfg["FIG3_FLOOR"], cfg["FIG3_CEIL"]))
         lines.append(f"fig2  at the end of the stream (K={cfg['K_TASKS']})")
-        lines.append(f"  {'d_f':>5s} {'n_b':>4s} " + head)
-        for d in cfg["DENSITIES"]:
-            r = cases[d]
-            lines.append(f"  {d:5.2f} {r['n_b']:4d} "
-                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}"
-                         f"{r['ret_x'][-1]:15.4g} {r['tr_x'][-1]:15.4g}"
-                         f"{r['gap']:11.1e}")
+        lines.append("  2a, one trace per density (d_f = d_b)")
+        lines.append(f"  {'d_f':>9s} {'n_b':>4s} " + head)
+        lines += rows(dens, [(t[0], f"{t[3]:g}") for t in t_d], ARMS)
+        lines.append(f"  2b, one trace per split ratio at d_f={cfg['FIG2B_DF']:g}")
+        lines.append(f"  {'rho':>9s} {'n_b':>4s} " + head)
+        lines += rows(split, [(t[0], f"{t[0][1]:g}") for t in t_s], ARMS)
+        lines.append("")
+
+    if not want or "8" in want:
+        print("figures 8a and 8b: the weights against task index ...")
+        t_d, t_s = density_traces(cfg, dens), split_traces(cfg, split)
+        fig_vs_tasks(cfg, dens, here / "fig8a_weight_vs_tasks.png", ARMS_W, t_d,
+                     "the weight change and the weight itself, one trace per density",
+                     NOTE_WEIGHT, ylog=True)
+        fig_vs_tasks(cfg, split, here / "fig8b_weight_vs_split.png", ARMS_W, t_s,
+                     f"the same at $d_f={cfg['FIG2B_DF']:g}$, one trace per split "
+                     "ratio", NOTE_WEIGHT,
+                     cap=(cfg["FIG8_FLOOR"], cfg["FIG8_CEIL"]))
+        lines.append(f"fig8  at the end of the stream (K={cfg['K_TASKS']}).  "
+                     "mean dW = ||W^K - W^{K-1}||_F on the arriving task;")
+        lines.append("      mean |W| = the mean of |W^K_ia| over all N x N_in "
+                     "weights, after it trained.")
+        lines.append("  8a, one trace per density (d_f = d_b)")
+        lines.append(f"  {'d_f':>9s} {'n_b':>4s} " + head_w)
+        lines += rows(dens, [(t[0], f"{t[3]:g}") for t in t_d], ARMS_W)
+        lines.append(f"  8b, one trace per split ratio at d_f={cfg['FIG2B_DF']:g}")
+        lines.append(f"  {'rho':>9s} {'n_b':>4s} " + head_w)
+        lines += rows(split, [(t[0], f"{t[0][1]:g}") for t in t_s], ARMS_W)
         lines.append("")
 
     if not want or "3" in want:
         print("figure 3: against task index, one trace per split ratio ...")
-        cases = {}
-        for d in cfg["SPLIT_DENSITIES"]:
-            for rho in cfg["SPLIT_RHOS"]:
-                try:
-                    cases[(d, rho)] = case_vs_tasks(cfg, d, rho, stream=SPLIT)
-                except ValueError:
-                    pass
-        fig_vs_tasks_split(cfg, cases, here / "fig3_vs_tasks_split.png", gap)
+        cases = split
+        fig_vs_tasks_split(cfg, cases, here / "fig3_vs_tasks_split.png")
         lines.append(f"fig3  at the end of the stream (K={cfg['K_TASKS']})")
         lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
         for (d, rho), r in sorted(cases.items()):
@@ -1987,7 +2290,7 @@ def main(argv):
                     grid[(d, rho)] = case_vs_density(cfg, d, rho)
                 except ValueError:
                     pass
-        fig_vs_density(cfg, grid, here / "fig4_vs_density.png", gap)
+        fig_vs_density(cfg, grid, here / "fig4_vs_density.png")
         lines.append(f"fig4  at the end of the stream (K={cfg['K_DENSITY']})")
         lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
         for (d, rho), r in sorted(grid.items()):
