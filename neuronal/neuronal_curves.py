@@ -278,6 +278,31 @@ def read_back(Gamma, R, s):
     return -U @ R[:s]
 
 
+def exact_scores(v, F, B, Theta, eval_states):
+    """The same two scores from the closed form, with nothing trained.
+
+    Route two.  Build the coupling eq. (19) from the gates and the readout, solve
+    the whole stream in one triangular system eq. (27), and read every task back
+    out of the wanted states with the band operator eq. (30).  The walk in
+    `run_stream` never happens: no state is ever formed, no task is ever trained.
+
+    The note says the two routes give the same numbers, and the figures draw both
+    so that the claim is visible rather than asserted.  They are not independent
+    -- both use the one draw of (v, F, B, Theta) -- but they share no arithmetic,
+    so a disagreement would be real.  Cost is O(K^2 N) to build Gamma and
+    O(K^2 D) to solve, against O(K N D) for the walk, and Gamma is 200 MB at
+    K = 5000; that is why this is a second pass and not the main one.
+    """
+    G = coupling(v, F, B)
+    R = solve_stream(G, Theta)
+    U = np.triu(G, 1)
+    ret = {}
+    for s_ in eval_states:
+        s_ = int(s_)
+        ret[s_] = float(rownorm(-(U[:s_, :s_] @ R[:s_])).mean())
+    return rownorm(R), ret
+
+
 # ============================================== the mean field, Gamma -> d_f
 
 def mf_resid(d_f, t, Delta):
@@ -571,58 +596,108 @@ def fig_flow(cfg, res, path):
 # ============================================================ figures 2 and 3
 
 def case_vs_tasks(cfg, d_f, rho=1.0, seed0=100):
-    """One (d_f, rho), scored at logarithmically spaced states of a stream of K.
+    """One (d_f, rho), scored at logarithmically spaced states, by both routes.
 
     Retention is evaluated exactly at those states -- it is already an average over
     every task the stream has trained, so nothing more is pooled within a draw.
     Transfer is one number per task, so it is pooled over the interval of arrivals
-    ending at each state.  Draws are combined geometrically in both cases.
+    ending at each state.  Draws are combined geometrically in both cases, and the
+    walk and the closed form see the same draws.
     """
     N, D, K = cfg["N"], cfg["D"], cfg["K_TASKS"]
     n_f, n_b = counts(N, d_f, rho)
     pts = log_points(K, cfg["N_POINTS_DECADE"])
-    ret_raw = np.full((cfg["SEEDS"], pts.size), np.nan)
-    tr_raw = np.full((cfg["SEEDS"], pts.size), np.nan)
     edges = np.concatenate([[0], pts])
+    shape = (cfg["SEEDS"], pts.size)
+    raw = {k: np.full(shape, np.nan) for k in
+           ("ret", "tr", "ret_x", "tr_x")}
+    gap = 0.0
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=seed0 + s)
         tr, ret = run_stream(v, F, B, Theta, pts)
-        ret_raw[s] = [ret[int(k)] for k in pts]
+        tr_x, ret_x = exact_scores(v, F, B, Theta, pts)
+        gap = max(gap, _route_gap(tr, tr_x), _route_gap(
+            np.array([ret[int(k)] for k in pts]),
+            np.array([ret_x[int(k)] for k in pts])))
+        raw["ret"][s] = [ret[int(k)] for k in pts]
+        raw["ret_x"][s] = [ret_x[int(k)] for k in pts]
         for q in range(pts.size):
-            tr_raw[s, q] = geo(tr[edges[q]:edges[q + 1]])
-    return dict(x=pts.astype(float), n_b=n_b,
-                ret=np.array([geo(ret_raw[:, q]) for q in range(pts.size)]),
-                tr=np.array([geo(tr_raw[:, q]) for q in range(pts.size)]))
+            raw["tr"][s, q] = geo(tr[edges[q]:edges[q + 1]])
+            raw["tr_x"][s, q] = geo(tr_x[edges[q]:edges[q + 1]])
+    out = {k: np.array([geo(a[:, q]) for q in range(pts.size)])
+           for k, a in raw.items()}
+    out["x"], out["n_b"], out["gap"] = pts.astype(float), n_b, gap
+    return out
 
 
-def _tasks_panel(ax, arm, x, y, colour, label=None):
-    ok = np.isfinite(y) & (y > 0)
-    ln, = ax.plot(x[ok], y[ok], color=colour, linewidth=1.8, zorder=3,
-                  solid_capstyle="round", label=label)
-    return ln, (x[ok][-1], y[ok][-1]) if ok.any() else None
+def _route_gap(a, b):
+    """Largest relative disagreement between the two routes, ignoring exact zeros."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    m = np.isfinite(a) & np.isfinite(b) & (np.abs(b) > 0)
+    if not m.any():
+        return 0.0
+    return float(np.max(np.abs(a[m] - b[m]) / np.abs(b[m])))
+
+
+def _three(ax, x, sim, exact, mf, colour, label=None):
+    """One series, three ways: simulation, the closed form, and the mean field.
+
+    The walk is drawn broad and translucent and the closed form thin on top of it,
+    because the two are the same numbers: what the reader should see is a dashed
+    line riding inside a solid band, not two curves to compare.  The mean field is
+    dotted and is a different quantity, so it is drawn at full weight underneath.
+    """
+    ok = np.isfinite(sim) & (sim > 0)
+    ln, = ax.plot(x[ok], sim[ok], color=colour, linewidth=2.8, alpha=0.40,
+                  solid_capstyle="round", zorder=3, label=label)
+    if exact is not None:
+        okx = np.isfinite(exact) & (exact > 0)
+        ax.plot(x[okx], exact[okx], color=colour, linewidth=1.2,
+                linestyle=(0, (5, 2)), zorder=4)
+    if mf is not None:
+        m = np.asarray(mf, dtype=float)
+        okm = np.isfinite(m) & (m > 0)
+        ax.plot(x[okm], m[okm], color=colour, linewidth=1.3,
+                linestyle=(0, (1, 2)), zorder=2)
+    return ln, ((float(x[ok][-1]), float(sim[ok][-1])) if ok.any() else None)
+
+
+def _route_legend(colour=None):
+    """The three line styles, named once per figure."""
+    from matplotlib.lines import Line2D
+    c = colour or MUTED
+    return [Line2D([], [], color=c, lw=2.8, alpha=0.40, label="simulation"),
+            Line2D([], [], color=c, lw=1.2, ls=(0, (5, 2)),
+                   label="whole stream, eq. (27) & (30)"),
+            Line2D([], [], color=c, lw=1.3, ls=(0, (1, 2)),
+                   label="mean field, $\\Gamma\\to d_f$ (r.m.s.)")]
+
+
+def _mf_curve(d_f, x, arm):
+    """The mean field on the same abscissa as the measured traces."""
+    if arm == "ret":
+        return np.array([mf_retention(d_f, int(k)) for k in x])
+    return np.asarray(mf_resid(d_f, x, -1), dtype=float)
 
 
 def fig_vs_tasks(cfg, cases, path, solve_gap):
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
     fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.0), sharex=True)
     handles = []
+    worst = max(c["gap"] for c in cases.values())
     for ci, (arm, ylab, sub) in enumerate(ARMS):
         ax = axes[ci]
         ends = []
         for k, d_f in enumerate(cfg["DENSITIES"]):
             res = cases[d_f]
-            ln, end = _tasks_panel(ax, arm, res["x"], res[arm], SERIES[k],
-                                   f"$d_f=d_b={d_f}$" if ci == 0 else None)
+            ln, end = _three(ax, res["x"], res[arm], res[arm + "_x"],
+                             _mf_curve(d_f, res["x"], arm), SERIES[k],
+                             f"$d_f=d_b={d_f}$" if ci == 0 else None)
             if ci == 0:
                 handles.append(ln)
             if end:
                 ends.append((end[0], end[1], f"{d_f}"))
-            th = ([mf_retention(d_f, int(k_)) for k_ in res["x"]] if arm == "ret"
-                  else mf_resid(d_f, res["x"], -1))
-            ax.plot(res["x"], th, color=SERIES[k], linewidth=1.3,
-                    linestyle=(0, (1, 2)), zorder=2)
         ax.set_xscale("log")
         _baseline(ax)
         ax.set_title(sub, fontsize=10, color=INK, pad=8)
@@ -631,24 +706,22 @@ def fig_vs_tasks(cfg, cases, path, solve_gap):
         _chrome(ax)
         _end_labels(ax, ends)
 
-    style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
-             Line2D([], [], color=MUTED, lw=1.3, ls=(0, (1, 2)),
-                    label="mean field, $\\Gamma\\to d_f$ (r.m.s.)")]
-    fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=6,
-               loc="upper center", bbox_to_anchor=(0.5, 0.935), labelcolor=INK2)
+    fig.legend(handles=handles + _route_legend(), frameon=False, fontsize=8.5,
+               ncol=7, loc="upper center", bbox_to_anchor=(0.5, 0.935),
+               labelcolor=INK2)
     fig.suptitle("the raw residual, against how far into the stream the task sits   "
                  f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_TASKS']}$, "
                  f"{cfg['SEEDS']} draws;  0 = solved, 1 = no better than $W=0$)",
                  fontsize=11, color=INK, y=0.995)
     fig.text(0.5, 0.012,
-             "retention is the plain average over every task trained so far, so it "
-             "carries no lag; transfer is pooled geometrically over the arrivals in\n"
-             "each interval.  draws are combined geometrically throughout.  the mean "
-             "field is not a bound -- the residuals depend on $\\Gamma$ themselves,\n"
-             "through $(I+L)^{-1}$ -- but its variance adds to the read-back, so the "
-             "measured curve runs above it."
-             f"      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
-             f"{solve_gap:.1e}",
+             "the dashed line is the closed form on the same draws -- the coupling "
+             "eq. (19), one triangular solve eq. (27) and the band eq. (30), with no "
+             "state ever formed.\nit rides inside the solid band because the two are "
+             "the same numbers; here they agree to "
+             f"{worst:.0e} relative, worst case over every point drawn.\n"
+             "the mean field is a different quantity and is not a bound: the residuals "
+             "depend on $\\Gamma$ themselves, through $(I+L)^{-1}$, but its variance "
+             "adds to the read-back, so the measured curve runs above it.",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
     fig.tight_layout(rect=(0, 0.125, 1, 0.9))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
@@ -665,37 +738,33 @@ def fig_vs_tasks_split(cfg, cases, path, solve_gap):
     it actually reached.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
     dens = cfg["SPLIT_DENSITIES"]
     rhos = cfg["SPLIT_RHOS"]
     lo, hi = cfg["FIG3_FLOOR"], cfg["FIG3_CEIL"]
+    worst = max(c["gap"] for c in cases.values())
     fig, axes = plt.subplots(len(dens), 2, figsize=(12.6, 10.4), sharex=True)
     handles = []
     for ri, d_f in enumerate(dens):
         for ci, (arm, ylab, sub) in enumerate(ARMS):
             ax = axes[ri][ci]
-            ends = []
-            res = None
+            ends, res = [], None
             for k, rho in enumerate(rhos):
                 if (d_f, rho) not in cases:
                     continue
                 res = cases[(d_f, rho)]
-                x, y = res["x"], res[arm]
-                ok = np.isfinite(y) & (y > 1e-9)
-                ln, = ax.plot(x[ok], y[ok], color=SERIES[k], linewidth=1.8, zorder=3,
-                              solid_capstyle="round",
-                              label=f"$d_f/d_b={rho:g}$" if ri + ci == 0 else None)
+                ln, end = _three(ax, res["x"], res[arm], res[arm + "_x"], None,
+                                 SERIES[k],
+                                 f"$d_f/d_b={rho:g}$" if ri + ci == 0 else None)
                 if ri + ci == 0:
                     handles.append(ln)
-                if ok.any():
-                    last = float(y[ok][-1])
+                if end:
+                    last = end[1]
                     text = (f"{rho:g}" if last <= hi else
                             f"{rho:g} $\\to10^{{{int(np.log10(last))}}}$")
-                    ends.append((x[ok][-1], min(last, hi), text))
+                    ends.append((end[0], min(last, hi), text))
             # one dotted curve for the row: the mean field cannot see the split
-            th = np.array([mf_retention(d_f, int(k_)) for k_ in res["x"]]
-                          if arm == "ret" else mf_resid(d_f, res["x"], -1))
+            th = _mf_curve(d_f, res["x"], arm)
             good = th > 1e-9
             ax.plot(res["x"][good], th[good], color=MUTED, linewidth=1.3,
                     linestyle=(0, (1, 2)), zorder=2)
@@ -712,11 +781,9 @@ def fig_vs_tasks_split(cfg, cases, path, solve_gap):
             _chrome(ax)
             _end_labels(ax, ends, gap=0.075)
 
-    style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
-             Line2D([], [], color=MUTED, lw=1.3, ls=(0, (1, 2)),
-                    label="mean field (r.m.s.), one curve per row")]
-    fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=5,
-               loc="upper center", bbox_to_anchor=(0.5, 0.96), labelcolor=INK2)
+    fig.legend(handles=handles + _route_legend(), frameon=False, fontsize=8.5,
+               ncol=6, loc="upper center", bbox_to_anchor=(0.5, 0.96),
+               labelcolor=INK2)
     fig.suptitle("the raw residual against task index, at three read densities   "
                  f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={cfg['K_TASKS']}$, "
                  f"{cfg['SEEDS']} draws;  1 = no better than $W=0$)",
@@ -724,11 +791,12 @@ def fig_vs_tasks_split(cfg, cases, path, solve_gap):
     fig.text(0.5, 0.008,
              "the vertical axis stops at $10^{6}$: past the threshold of eq. (40) the "
              "state grows like $\\exp(\\lambda K)$ and $d_f/d_b=5$ ends between "
-             "$10^{61}$ and $10^{86}$,\nso a trace that leaves the panel is labelled "
-             "with the decade it reached.  the dotted curve is the same in every trace "
-             "of a row, because $E[\\Gamma_{kt}]=d_f$ whatever $d_b$ is."
-             f"\n      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
-             f"{solve_gap:.1e}",
+             "$10^{61}$ and $10^{86}$, so a trace that leaves\nthe panel is labelled "
+             "with the decade it reached.  the dashed closed form rides inside the "
+             f"solid band, agreeing to {worst:.0e} relative at worst -- eighty decades "
+             "of growth\ncost the triangular solve nothing.  the dotted mean field is "
+             "the same in every trace of a row, because $E[\\Gamma_{kt}]=d_f$ whatever "
+             "$d_b$ is.",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
     fig.tight_layout(rect=(0, 0.055, 1, 0.945))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
@@ -738,7 +806,7 @@ def fig_vs_tasks_split(cfg, cases, path, solve_gap):
 # ==================================================================== figure 4
 
 def case_vs_density(cfg, d_f, rho):
-    """Both scores at the end of a stream of K_DENSITY, at one (d_f, rho).
+    """Both scores at the end of a stream of K_DENSITY, by both routes.
 
     Retention is the average over every task the stream trained, read out of the
     final state.  Transfer is pooled over the arrivals in the last DENSITY_TAIL of
@@ -747,38 +815,48 @@ def case_vs_density(cfg, d_f, rho):
     N, D, K = cfg["N"], cfg["D"], cfg["K_DENSITY"]
     n_f, n_b = counts(N, d_f, rho)
     lo = int(round((1.0 - cfg["DENSITY_TAIL"]) * K))
-    ret_raw, tr_raw = [], []
+    acc = {k: [] for k in ("ret", "tr", "ret_x", "tr_x")}
+    gap = 0.0
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=200 + s)
         tr, ret = run_stream(v, F, B, Theta, (K,))
-        ret_raw.append(ret[K])
-        tr_raw.append(geo(tr[lo:]))
-    return dict(ret=geo(ret_raw), tr=geo(tr_raw), n_b=n_b, K=K)
+        tr_x, ret_x = exact_scores(v, F, B, Theta, (K,))
+        gap = max(gap, _route_gap(tr, tr_x),
+                  _route_gap([ret[K]], [ret_x[K]]))
+        acc["ret"].append(ret[K])
+        acc["ret_x"].append(ret_x[K])
+        acc["tr"].append(geo(tr[lo:]))
+        acc["tr_x"].append(geo(tr_x[lo:]))
+    out = {k: geo(x) for k, x in acc.items()}
+    out["n_b"], out["K"], out["gap"] = n_b, K, gap
+    return out
 
 
 def fig_vs_density(cfg, grid, path, solve_gap):
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
     d_fs = sorted({d for d, _ in grid})
     K = cfg["K_DENSITY"]
+    worst = max(c["gap"] for c in grid.values())
     fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.0), sharex=True)
     handles = []
     for ci, (arm, ylab, sub) in enumerate(ARMS):
         ax = axes[ci]
         ends = []
         for k, rho in enumerate(cfg["RHOS"]):
-            xs = [d for d in d_fs if (d, rho) in grid]
-            ys = [grid[(d, rho)][arm] for d in xs]
-            ln, = ax.plot(xs, ys, color=SERIES[k], linewidth=1.8, zorder=3,
-                          solid_capstyle="round",
-                          label=f"$d_f/d_b={rho:g}$" if ci == 0 else None)
+            xs = np.array([d for d in d_fs if (d, rho) in grid])
+            sim = np.array([grid[(d, rho)][arm] for d in xs])
+            exa = np.array([grid[(d, rho)][arm + "_x"] for d in xs])
+            ln, end = _three(ax, xs, sim, exa, None, SERIES[k],
+                             f"$d_f/d_b={rho:g}$" if ci == 0 else None)
             if ci == 0:
                 handles.append(ln)
-            ends.append((xs[-1], ys[-1], f"{rho:g}"))
-        th = [mf_retention(d, K) if arm == "ret" else float(mf_resid(d, K, -1))
-              for d in d_fs]
-        ax.plot(d_fs, th, color=MUTED, linewidth=1.4, linestyle=(0, (1, 2)), zorder=2)
+            if end:
+                ends.append((end[0], end[1], f"{rho:g}"))
+        th = np.array([mf_retention(d, K) if arm == "ret"
+                       else float(mf_resid(d, K, -1)) for d in d_fs])
+        ax.plot(d_fs, th, color=MUTED, linewidth=1.4, linestyle=(0, (1, 2)),
+                zorder=2)
         ax.set_yscale("log")
         _baseline(ax)
         ax.set_title(sub, fontsize=10, color=INK, pad=8)
@@ -787,22 +865,20 @@ def fig_vs_density(cfg, grid, path, solve_gap):
         _chrome(ax)
         _end_labels(ax, ends)
 
-    style = [Line2D([], [], color=MUTED, lw=1.8, label="simulation"),
-             Line2D([], [], color=MUTED, lw=1.4, ls=(0, (1, 2)),
-                    label="mean field (r.m.s.), one curve for all three")]
-    fig.legend(handles=handles + style, frameon=False, fontsize=8.5, ncol=5,
-               loc="upper center", bbox_to_anchor=(0.5, 0.935), labelcolor=INK2)
+    fig.legend(handles=handles + _route_legend(), frameon=False, fontsize=8.5,
+               ncol=6, loc="upper center", bbox_to_anchor=(0.5, 0.935),
+               labelcolor=INK2)
     fig.suptitle("the raw residual at the end of the stream, against read density   "
                  f"($N={cfg['N']}$, $N_{{in}}={cfg['D']}$, $K={K}$, "
                  f"{cfg['SEEDS']} draws)", fontsize=11, color=INK, y=0.995)
     fig.text(0.5, 0.012,
-             "one dotted curve serves all three ratios: $E[\\Gamma_{kt}]=d_f$ whatever "
-             "$d_b$ is, so everything the split does lives in second moments and in the\n"
-             "stability of eq. (17).   at $d_f=1$ the read gate is the identity, $\\Gamma$ "
-             "is exactly all-ones and the two must agree; the gap left there is the\n"
-             "estimator, $1.38$ against $1.41$, and the noise floor of the comparison."
-             f"      stream vs the exact solve (27) at $K={cfg['K_CHECK']}$: "
-             f"{solve_gap:.1e}",
+             "the dashed closed form rides inside the solid band, agreeing to "
+             f"{worst:.0e} relative at worst.  one dotted curve serves all three "
+             "ratios: $E[\\Gamma_{kt}]=d_f$ whatever\n$d_b$ is, so everything the "
+             "split does lives in second moments and in the stability of eq. (17).   "
+             "at $d_f=1$ the read gate is the identity, $\\Gamma$ is exactly\nall-ones "
+             "and the mean field must agree; the gap left there is the estimator, "
+             "$1.38$ against $1.41$, and the noise floor of the comparison.",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
     fig.tight_layout(rect=(0, 0.125, 1, 0.9))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
@@ -923,19 +999,15 @@ def fig_heatmaps(cfg, cells, path):
 # ================================================================== self-test
 
 def solve_check(cfg, d_f=0.3, rho=2.0, seed=11):
-    """The streamed scores against the exact triangular solve, eq. (27) and (30)."""
+    """The walk against the closed form, on exactly the path the figures draw."""
     N, D, K = cfg["N"], cfg["D"], cfg["K_CHECK"]
     n_f, n_b = counts(N, d_f, rho)
     states = (K // 4, K // 2, K)
     v, F, B, Theta = draw(N, D, K, n_f, n_b, seed=seed)
     tr, ret = run_stream(v, F, B, Theta, states)
-    G = coupling(v, F, B)
-    R = solve_stream(G, Theta)
-    gap = np.abs(tr - rownorm(R)).max() / rownorm(R).max()
-    for s in states:
-        direct = float(rownorm(read_back(G, R, s)).mean())
-        gap = max(gap, abs(ret[s] - direct) / direct)
-    return float(gap)
+    tr_x, ret_x = exact_scores(v, F, B, Theta, states)
+    return max(_route_gap(tr, tr_x),
+               _route_gap([ret[s] for s in states], [ret_x[s] for s in states]))
 
 
 def self_test(cfg, verbose=True):
@@ -1049,6 +1121,36 @@ def _grid(lo, hi, step):
     return [round(lo + i * step, 9) for i in range(n)]
 
 
+def _write_log(path, lines, want):
+    """Write the run log, keeping the sections this run did not regenerate.
+
+    Asking for a subset of the figures used to leave a log describing only that
+    subset, which is worse than no log at all.  Sections are keyed by their "figN"
+    heading, the ones just produced replace their old text, and the rest are
+    carried over in order.
+    """
+    def split(text):
+        head, out, key = [], {}, None
+        for ln in text.split("\n"):
+            if ln[:3] == "fig" and ln[3:4].isdigit():
+                key = ln[:4]
+                out[key] = []
+            (out[key] if key else head).append(ln)
+        return head, out
+
+    head, fresh = split("\n".join(lines))
+    kept = {}
+    if path.exists():
+        _, kept = split(path.read_text())
+    kept.update(fresh)
+    body = []
+    for k in sorted(kept):
+        if want and k[3:] not in want and k in fresh:
+            continue
+        body += kept[k]
+    path.write_text("\n".join(head + body).rstrip() + "\n")
+
+
 def main(argv):
     here = Path(__file__).resolve().parent
     want = {a for a in argv if a in {"1", "2", "3", "4", "5"}}
@@ -1070,8 +1172,11 @@ def main(argv):
              "  transfer(K)  = ||theta_K - thetahat_K^(K-1)||",
              "  retention(K) = (1/K) sum_{i<=K} ||theta_i - thetahat_i^(K)||",
              "0 = solved, 1 = no better than W = 0.  draws combined geometrically.",
+             "the eq.27/30 columns are the same scores from the closed form, with",
+             "nothing trained; 'route gap' is the largest relative disagreement.",
              ""]
-    head = f"{'retention':>14s} {'transfer':>14s}"
+    head = (f"{'retention':>14s} {'transfer':>14s}"
+            f"{'ret, eq.27/30':>15s} {'tr, eq.27/30':>15s} {'route gap':>11s}")
 
     if not want or "1" in want:
         print("\nfigure 1: the flow ...")
@@ -1091,7 +1196,9 @@ def main(argv):
         for d in cfg["DENSITIES"]:
             r = cases[d]
             lines.append(f"  {d:5.2f} {r['n_b']:4d} "
-                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}")
+                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}"
+                         f"{r['ret_x'][-1]:15.4g} {r['tr_x'][-1]:15.4g}"
+                         f"{r['gap']:11.1e}")
         lines.append("")
 
     if not want or "3" in want:
@@ -1108,7 +1215,9 @@ def main(argv):
         lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
         for (d, rho), r in sorted(cases.items()):
             lines.append(f"  {d:5.2f} {rho:4.1f} {r['n_b']:4d} "
-                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}")
+                         f"{r['ret'][-1]:14.4g} {r['tr'][-1]:14.4g}"
+                         f"{r['ret_x'][-1]:15.4g} {r['tr_x'][-1]:15.4g}"
+                         f"{r['gap']:11.1e}")
         lines.append("")
 
     if not want or "4" in want:
@@ -1125,7 +1234,9 @@ def main(argv):
         lines.append(f"  {'d_f':>5s} {'rho':>4s} {'n_b':>4s} " + head)
         for (d, rho), r in sorted(grid.items()):
             lines.append(f"  {d:5.2f} {rho:4.1f} {r['n_b']:4d} "
-                         f"{r['ret']:14.4g} {r['tr']:14.4g}")
+                         f"{r['ret']:14.4g} {r['tr']:14.4g}"
+                         f"{r['ret_x']:15.4g} {r['tr_x']:15.4g}"
+                         f"{r['gap']:11.1e}")
         lines.append("")
 
     if not want or "5" in want:
@@ -1148,7 +1259,7 @@ def main(argv):
                              f"{snap[k]['ret']:14.4g} {snap[k]['tr']:14.4g}")
         lines.append("")
 
-    (here / "neuronal_curves.txt").write_text("\n".join(lines))
+    _write_log(here / "neuronal_curves.txt", lines, want)
     print(f"\nwritten to {here}")
     return 0
 
