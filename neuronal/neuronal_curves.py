@@ -18,7 +18,9 @@ squaring, no ratio:
     transfer(K)    ||r_K||,  r_K = theta_K - thetahat_K^(K-1)       eq. (12)
 
         the task that arrives at step K, read out of the state just before it
-        trains: what the stream has left for it before it does any work of its own
+        trains: what the stream has left for it before it does any work of its own.
+        One task, one number: nothing is pooled over the tasks around it, and the
+        only average is over seeds
 
     retention(K)   (1/K) sum_{i=1}^{K} ||r_i^(K)||,
                    r_i^(K) = theta_i - thetahat_i^(K)               eq. (28)
@@ -40,23 +42,28 @@ The third is the size of the weight change itself, in two readings:
         ||r_t|| / sqrt(c_t) -- a residual divided by the square root of the mass
         that had to carry it.
 
-    disp(T) = ||W^T||_F / T                                 the net displacement
+    disp(T) = ||W^T||_F                                     the net displacement
 
-        the same increments summed before the norm is taken rather than after.
-        step(T) is the mean length of a step and disp(T) the length of the mean
-        step, so disp <= step always and the ratio is how much of the movement
-        cancelled.  In the stable regime it does: the state random-walks and disp
-        falls like T^{-1/2}, while at d_f = d_b = 1 the sum telescopes exactly and
-        ||W^T||_F = 1/||v|| for every T, so disp falls like 1/T.
+        how far the state has moved from W^0 = 0: the same increments summed
+        before the norm is taken rather than after.  It is not divided by T -- it
+        measures the weights, not a rate -- so a state that has stopped growing
+        reads flat.  T step(T) is the length of the path and disp(T) the distance
+        between its ends, so disp(T) <= T step(T) always, and the ratio of the two
+        is the fraction of the movement that did not cancel.
+
+        Measured at N = 200: in the stable regime the state saturates, 7.5, 14.9
+        and 18.6 at T = 50, 500 and 5000 for d_f = d_b = 0.5 -- the contraction
+        of eq. (32).  At d_f = 1 and rho > 1 the readout pins v^T W to the latest
+        teacher and the directions it cannot see random-walk, so disp grows like
+        sqrt(T): 9.8, 31 and 98 at rho = 2.  At d_f = d_b = 1 the sum telescopes
+        exactly and ||W^T||_F = 1/||v|| for every T.
 
 Figure 8 reads the same weights against the task index rather than averaged over
 the stream: the left panel is the step of eq. (16) that the arriving task itself
-took, ||W^K - W^{K-1}||_F, and the right is the typical weight it left behind,
-
-    <|W^K_ia|>   the mean of |W_ia| over all N x N_in weights, at state K
-
--- a magnitude, not a norm, so it says how large a single synapse has grown rather
-than how far the state has moved.
+took, ||W^K - W^{K-1}||_F, and the right is disp(K) = ||W^K||_F once it has
+trained -- figure 7's metric, in the same units as the step beside it, so the
+right panel over the left says how many steps long the state is.  Like transfer,
+the step is task K's own and is not pooled over the tasks around it.
 
 Seeds -- independent draws of (readout, gates, teachers) -- are combined
 geometrically, and every figure carries the standard error of that mean, taken in
@@ -80,10 +87,10 @@ Figures written next to this file:
     fig5_heatmaps.png     density x splitness, three snapshots of one run
     fig6_step.png         the average step, three stream lengths: against density,
                           against splitness, and the two against each other
-    fig7_displacement.png the net displacement per task, the same three panels
+    fig7_displacement.png the net displacement ||W^T||_F, the same three panels
     fig8a_weight_vs_tasks.png   figure 2a's axes, carrying the weights instead of
                           the residual: the step of the arriving task, and the
-                          typical weight it leaves behind
+                          net displacement it leaves behind
     fig8b_weight_vs_split.png   the same at d_f = FIG2B_DF, per split ratio
 
 Figures 2 and 8 come in an `a` and a `b`: `a` varies the density at d_f = d_b, `b`
@@ -134,25 +141,24 @@ CONFIG = dict(
                       #   actually ended
     FIG2B_DF=0.5,    # figures 2b and 8b: the density held fixed while the split
                      #      varies over SPLIT_RHOS, the same three ratios as fig. 3
-    FIG8_FLOOR=1e-3, # figure 8b's y-limits, as FIG3_* are figure 2b's
-    FIG8_CEIL=1e6,
+    FIG8_FLOOR=1e-1, # figure 8b's y-limits, as FIG3_* are figure 2b's.  neither
+    FIG8_CEIL=1e6,   #      arm goes much below 1: the first step alone is
+                     #      1/sqrt(c_1) >= 1/||v||
     N_POINTS_DECADE=12,   # states sampled per decade of the logarithmic axis.
-                     #      retention is evaluated exactly at those states;
-                     #      transfer is the geometric mean over the interval
-                     #      ending at each of them
+                     #      every arm is read exactly there and nowhere else:
+                     #      retention and the displacement at state K, transfer
+                     #      and the step at task K, the arrival that made it
 
     # --- figure 4, against density -----------------------------------------
     K_DENSITY=1500,  # stream length; both scores are read at the end of it
     RHOS=(1.0, 2.0, 3.0),             # d_f / d_b, one trace each
     DF_STEP=0.05,    # read-density grid, from D/N to 1.0
-    DENSITY_TAIL=0.25,  # fraction of the stream transfer is pooled over
 
     # --- figure 5, density against splitness -------------------------------
     K_HEAT=1000,     # one run per cell; the three columns are snapshots of it
     SNAPSHOTS=(10, 100, 1000),
     HEAT_DF_STEP=0.1,                 # read density, from D/N to 1.0
     HEAT_RHOS=tuple(range(1, 11)),    # splitness 1..10
-    HEAT_WINDOW=0.1, # anchors transfer is pooled over, as a fraction of k
     HEAT_CEIL=2.0,   # colour ceiling in log10||r||: a cell only has to read as
                      #   "a hundred times the baseline or worse".  the .txt keeps
                      #   the unclipped numbers
@@ -359,8 +365,6 @@ def run_stream(v, F, B, Theta, eval_states=()):
                     something the self-test can check rather than assume
         disp  dict  state s -> ||W^s||_F, how far the state has moved from W^0 = 0
                     once the steps have been allowed to cancel
-        wmag  dict  state s -> mean |W^s_ia| over all N x D weights: the typical
-                    size of a weight, not of the state
 
     Retention needs the whole history read out of one state, which is a single
     (s, N) x (N, D) product, so a state costs O(s N D) and the walk itself costs
@@ -378,7 +382,7 @@ def run_stream(v, F, B, Theta, eval_states=()):
     W = np.zeros((N, Theta.shape[1]))
     tr = np.empty(K)
     dw = np.empty(K)
-    ret, disp, wmag = {}, {}, {}
+    ret, disp = {}, {}
     want = {int(s) for s in eval_states}
 
     for t in range(K):
@@ -391,8 +395,7 @@ def run_stream(v, F, B, Theta, eval_states=()):
         if s in want:
             ret[s] = float(rownorm(Theta[:s] - Fv[:s] @ W).mean())
             disp[s] = fro(W)
-            wmag[s] = float(np.abs(W).mean())
-    return tr, ret, dw, disp, wmag
+    return tr, ret, dw, disp
 
 
 # ================================================= the exact route, eq. (27)
@@ -525,7 +528,7 @@ def exact_scores(v, F, B, Theta, eval_states, retention=True):
     R = solve_stream(G, Theta)
     Rn = rownorm(np.asarray(R))
     A = xp.asarray((B * v[None, :]) / c[:, None])         # rows a_t / c_t, eq. (16)
-    ret, disp, wmag = {}, {}, {}
+    ret, disp = {}, {}
     for s_ in eval_states:
         s_ = int(s_)
         if retention:
@@ -533,8 +536,7 @@ def exact_scores(v, F, B, Theta, eval_states, retention=True):
                                                  @ R[:s_]))).mean())
         Ws = np.asarray(A[:s_].T @ R[:s_])             # W^s, eq. (16) summed
         disp[s_] = fro(Ws)
-        wmag[s_] = float(np.abs(Ws).mean())
-    return Rn, ret, Rn / np.sqrt(c), disp, wmag
+    return Rn, ret, Rn / np.sqrt(c), disp
 
 
 # ============================================== the mean field, Gamma -> d_f
@@ -705,44 +707,6 @@ def mf_step_at(d_f, d_b, t):
     return np.asarray(mf_resid(d_f, t, -1), dtype=float) / np.sqrt(d_b)
 
 
-def mf_wmag(d_f, d_b, K, N, D):
-    """The mean field's mean |W_ia| at state K: one shape factor times the norm.
-
-    An entry of the state is W_ia = v_i sum_t b^(t)_i r_{t,a}/c_t -- a readout weight
-    times a sum that is near-Gaussian in its own right.  Writing W_ia = v_i g_ia with
-    g independent of v and i.i.d. of variance sigma^2,
-
-        E|W_ia|    = E|v_i| E|g| = sqrt(2/(pi N)) * sqrt(2/pi) sigma
-        E||W||_F^2 = N D E[v_i^2] E[g^2] = D sigma^2      (E[v_i^2] = 1/N)
-
-    so the ratio is free of sigma and of the stream:
-
-        E|W_ia| = (2/pi) ||W||_F / sqrt(N D) .
-
-    The 2/pi and not sqrt(2/pi): the row scale v_i is itself random, so an entry is
-    a scale mixture and its mean absolute value is smaller than that of a Gaussian
-    of the same variance, which would give sqrt(2/pi).
-
-    **The factor is not actually constant, and 2/pi is the calibrated end of its
-    range, not a derivation that holds everywhere.**  Measured off the walk at
-    N = 60, N_in = 12, the ratio mean|W_ia| sqrt(N N_in) / ||W||_F runs
-
-        0.625  0.641   at d_f = d_b = 1,  K = 40, 400   (2/pi   = 0.637)
-        0.721  0.779   at d_f = d_b = 0.1                (sqrt(2/pi) = 0.798)
-
-    -- from the scale mixture up towards the plain Gaussian as the gate thins and
-    the stream lengthens, because a sparse gate writes each row through a different
-    subset of tasks and the common v_i scale stops dominating.  2/pi is chosen
-    because it is exact at d_f = d_b = 1, where the state is rank one,
-    W = v theta^T/||v||^2, and every other curve in this file is exact too; that
-    corner is the note's calibration point.  Everywhere else this reads up to 22%
-    low, which is small beside the factor of 2.7 that `mf_displacement` -- the
-    magnitude being scaled -- is already loose by.  The self-test brackets the
-    measured factor rather than asserting a constant.
-    """
-    return float(2.0 / np.pi * mf_displacement(d_f, d_b, K) / np.sqrt(N * D))
-
-
 def geo_sem(x):
     """Geometric mean over seeds, the standard error of that mean, and the count.
 
@@ -857,12 +821,14 @@ ARMS = (("ret", r"retention:   $\frac{1}{K}\sum_{i\leq K}\|r_i^{(K)}\|$",
 
 # figure 8's pair.  The same two shapes as ARMS -- one quantity belonging to the
 # arriving task, one to the state it leaves behind -- read off the weights instead
-# of the residual.  Unlike ARMS, the mean field for these two does see the split:
-# E[Gamma_kt] = d_f whatever d_b is, but the write mass is d_b itself.
+# of the residual.  Both are the same norm, one of an increment and one of the sum
+# of them, so the right panel over the left is how many steps long the state is.
+# Unlike ARMS, the mean field for these two does see the split: E[Gamma_kt] = d_f
+# whatever d_b is, but the write mass is d_b itself.
 ARMS_W = (("dw", r"$\|W^K-W^{K-1}\|_F$",
            "the step the arriving task took, eq. (16)"),
-          ("wm", r"$\langle\,|W^K_{ia}|\,\rangle$",
-           "the typical weight after it trained, over all $N N_{in}$ of them"))
+          ("disp", r"$\|W^K\|_F$",
+           "how far the state has moved from $W^0=0$, after it trained"))
 
 
 # ==================================================================== figure 1
@@ -1005,20 +971,19 @@ def fig_flow(cfg, res, path):
 def case_vs_tasks(cfg, d_f, rho=1.0, stream=TASKS):
     """One (d_f, rho), scored at logarithmically spaced states, by both routes.
 
-    Retention is evaluated exactly at those states -- it is already an average over
-    every task the stream has trained, so nothing more is pooled within a seed.
-    Transfer is one number per task, so it is pooled over the interval of arrivals
-    ending at each state.  Seeds are combined geometrically in both cases, with the
-    standard error of that mean alongside, and the walk and the closed form see the
-    same seeds.
+    Every arm is read at the plotted point and nowhere else.  Retention and the
+    displacement belong to state K and are read out of it; transfer and the step
+    belong to task K, the arrival that trained into that state, and are that one
+    task's own numbers -- nothing is pooled over the tasks around it.  The only
+    average is over seeds, taken geometrically with the standard error of that mean
+    alongside, and the walk and the closed form see the same seeds.
     """
     N, D, K = cfg["N"], cfg["D"], cfg["K_TASKS"]
     n_f, n_b = counts(N, d_f, rho)
     pts = log_points(K, cfg["N_POINTS_DECADE"])
-    edges = np.concatenate([[0], pts])
     shape = (cfg["SEEDS"], pts.size)
     raw = {k: np.full(shape, np.nan) for k in
-           ("ret", "tr", "dw", "wm", "ret_x", "tr_x", "dw_x", "wm_x")}
+           ("ret", "tr", "dw", "disp", "ret_x", "tr_x", "dw_x", "disp_x")}
     gap = 0.0
 
     def at(d):
@@ -1027,20 +992,16 @@ def case_vs_tasks(cfg, d_f, rho=1.0, stream=TASKS):
 
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, stream, s))
-        tr, ret, dw, _, wm = run_stream(v, F, B, Theta, pts)
-        tr_x, ret_x, dw_x, _, wm_x = exact_scores(v, F, B, Theta, pts)
+        tr, ret, dw, disp = run_stream(v, F, B, Theta, pts)
+        tr_x, ret_x, dw_x, disp_x = exact_scores(v, F, B, Theta, pts)
         gap = max(gap, _route_gap(tr, tr_x), _route_gap(dw, dw_x),
-                  _route_gap(at(ret), at(ret_x)), _route_gap(at(wm), at(wm_x)))
+                  _route_gap(at(ret), at(ret_x)),
+                  _route_gap(at(disp), at(disp_x)))
         raw["ret"][s], raw["ret_x"][s] = at(ret), at(ret_x)
-        raw["wm"][s], raw["wm_x"][s] = at(wm), at(wm_x)
-        # the two per-task quantities are one number per arrival, so each is pooled
-        # over the interval of arrivals ending at the state it is plotted against,
-        # exactly as transfer has always been; the two per-state ones are not
-        for q in range(pts.size):
-            raw["tr"][s, q] = geo(tr[edges[q]:edges[q + 1]])
-            raw["tr_x"][s, q] = geo(tr_x[edges[q]:edges[q + 1]])
-            raw["dw"][s, q] = geo(dw[edges[q]:edges[q + 1]])
-            raw["dw_x"][s, q] = geo(dw_x[edges[q]:edges[q + 1]])
+        raw["disp"][s], raw["disp_x"][s] = at(disp), at(disp_x)
+        # task K is row K - 1: it is read out of state K - 1 and trains into state K
+        raw["tr"][s], raw["tr_x"][s] = tr[pts - 1], tr_x[pts - 1]
+        raw["dw"][s], raw["dw_x"][s] = dw[pts - 1], dw_x[pts - 1]
     out = {}
     for k, a in raw.items():
         agg = [geo_sem(a[:, q]) for q in range(pts.size)]
@@ -1127,11 +1088,12 @@ def _route_legend(colour=None, err=None):
     return out
 
 
-def _mf_curve(d_f, x, arm, d_b=None, N=None, D=None):
+def _mf_curve(d_f, x, arm, d_b=None):
     """The mean field on the same abscissa as the measured traces.
 
-    `d_b`, `N` and `D` are wanted only by the ARMS_W pair, which is the only one of
-    the four that can tell d_b from d_f.
+    `d_b` is wanted only by the ARMS_W pair, which is the only one of the four that
+    can tell d_b from d_f.  Every arm is a reading at one point, so every curve here
+    is evaluated at that point and averaged over nothing.
     """
     if arm == "ret":
         return np.array([mf_retention(d_f, int(k)) for k in x])
@@ -1139,7 +1101,7 @@ def _mf_curve(d_f, x, arm, d_b=None, N=None, D=None):
         return np.asarray(mf_resid(d_f, x, -1), dtype=float)
     if arm == "dw":
         return mf_step_at(d_f, d_b, x)
-    return np.array([mf_wmag(d_f, d_b, int(k), N, D) for k in x])
+    return np.array([mf_displacement(d_f, d_b, int(k)) for k in x])
 
 
 def density_traces(cfg, cases):
@@ -1206,8 +1168,7 @@ def fig_vs_tasks(cfg, cases, path, arms, traces, title, note, cap=None, ylog=Fal
         ends, res = [], None
         for k, (key, label, tag, d_f, d_b) in enumerate(traces):
             res = cases[key]
-            mf = None if blind else _mf_curve(d_f, res["x"], arm, d_b,
-                                              cfg["N"], cfg["D"])
+            mf = None if blind else _mf_curve(d_f, res["x"], arm, d_b)
             ln, end = _three(ax, res["x"], res[arm], res[arm + "_x"], mf, SERIES[k],
                              label if ci == 0 else None,
                              sem=res[arm + "_sem"], err="band")
@@ -1264,10 +1225,11 @@ NOTE_SCORE_SPLIT = ("one dotted mean field serves all three traces: "
                     "eq. (17).")
 NOTE_WEIGHT = ("the dotted mean field is $\\Gamma\\to d_f$ with the write mass at "
                "$E[c_t]=d_b\\|v\\|^2$; unlike the residual it does see the split, "
-               "through $1/\\sqrt{d_b}$.\nthe right-hand one carries a further shape "
-               "factor $2/\\pi$ over $\\sqrt{N N_{in}}$, exact only at the rank-one "
-               "corner $d_f=d_b=1$ and up to $22\\%$ low elsewhere,\non top of a "
-               "displacement that is itself loose -- read it as a scale, not a fit.")
+               "through $1/\\sqrt{d_b}$.\nthe right-hand one is exact at "
+               "$d_f=d_b=1$, where the sum telescopes, and loose elsewhere: it "
+               "decouples a gate overlap from the erasure that\noverlap causes, so it "
+               "grows like $\\sqrt{K}$ where the true displacement saturates -- read "
+               "it as a scale, not a fit.")
 
 
 def fig_vs_tasks_split(cfg, cases, path):
@@ -1352,24 +1314,23 @@ def case_vs_density(cfg, d_f, rho):
     """Both scores at the end of a stream of K_DENSITY, by both routes.
 
     Retention is the average over every task the stream trained, read out of the
-    final state.  Transfer is pooled over the arrivals in the last DENSITY_TAIL of
-    the stream, which is where it has settled.
+    final state.  Transfer is the last task alone, ||r_K||, read out of the state
+    just before it trains; the only average is over seeds.
     """
     N, D, K = cfg["N"], cfg["D"], cfg["K_DENSITY"]
     n_f, n_b = counts(N, d_f, rho)
-    lo = int(round((1.0 - cfg["DENSITY_TAIL"]) * K))
     acc = {k: [] for k in ("ret", "tr", "ret_x", "tr_x")}
     gap = 0.0
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, DENSITY, s))
-        tr, ret, _, _, _ = run_stream(v, F, B, Theta, (K,))
-        tr_x, ret_x, _, _, _ = exact_scores(v, F, B, Theta, (K,))
+        tr, ret, _, _ = run_stream(v, F, B, Theta, (K,))
+        tr_x, ret_x, _, _ = exact_scores(v, F, B, Theta, (K,))
         gap = max(gap, _route_gap(tr, tr_x),
                   _route_gap([ret[K]], [ret_x[K]]))
         acc["ret"].append(ret[K])
         acc["ret_x"].append(ret_x[K])
-        acc["tr"].append(geo(tr[lo:]))
-        acc["tr_x"].append(geo(tr_x[lo:]))
+        acc["tr"].append(tr[K - 1])
+        acc["tr_x"].append(tr_x[K - 1])
     out = {}
     for k, x in acc.items():
         out[k], out[k + "_sem"], out[k + "_n"] = geo_sem(x)
@@ -1424,8 +1385,9 @@ def fig_vs_density(cfg, grid, path):
              "ratios: $E[\\Gamma_{kt}]=d_f$ whatever\n$d_b$ is, so everything the "
              "split does lives in second moments and in the stability of eq. (17).   "
              "at $d_f=1$ the read gate is the identity, $\\Gamma$ is exactly\nall-ones "
-             "and the mean field must agree; the gap left there is the estimator, "
-             "$1.38$ against $1.41$, and the noise floor of the comparison.",
+             "and the mean field must agree; what is left there is the estimator -- a "
+             "geometric mean sits $\\exp(-1/4N_{in})$ below the r.m.s. -- and, for "
+             "transfer, the scatter of one task per seed.",
              ha="center", va="bottom", fontsize=8, color=MUTED, linespacing=1.5)
     fig.tight_layout(rect=(0, 0.125, 1, 0.9))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
@@ -1439,7 +1401,9 @@ def case_heat(cfg, d_f, rho):
 
     Retention at a snapshot is the average over every task trained by then, so
     every cell of the grid has one -- there is no lag that can reach back past the
-    start of the stream and no cell to leave blank.
+    start of the stream and no cell to leave blank.  Transfer at a snapshot is task
+    k alone, read out of the state just before it trains; the only average is over
+    seeds.
     """
     N, D, K = cfg["N"], cfg["D"], cfg["K_HEAT"]
     n_f, n_b = counts(N, d_f, rho)
@@ -1447,11 +1411,10 @@ def case_heat(cfg, d_f, rho):
     out = {k: {"ret": [], "tr": []} for k in snaps}
     for s in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, HEAT, s))
-        tr, ret, _, _, _ = run_stream(v, F, B, Theta, snaps)
+        tr, ret, _, _ = run_stream(v, F, B, Theta, snaps)
         for k in snaps:
-            nw = max(1, int(round(cfg["HEAT_WINDOW"] * k)))
             out[k]["ret"].append(ret[k])
-            out[k]["tr"].append(geo(tr[k - nw:k]))
+            out[k]["tr"].append(tr[k - 1])
     return {k: {m: geo(x) for m, x in d.items()} for k, d in out.items()}, n_b
 
 
@@ -1533,8 +1496,8 @@ def fig_heatmaps(cfg, cells, path):
                  f"{cfg['SEEDS']} seeds per cell)", fontsize=11, color=INK, y=0.965)
     fig.text(0.5, 0.012,
              "retention at $k$ averages every task trained by then, so no cell is "
-             f"missing.  transfer is pooled over the arrivals in the "
-             f"{cfg['HEAT_WINDOW']:.0%} window ending at $k$.\nthe scale stops at "
+             "missing.  transfer is task $k$ alone, read out of the state before it "
+             "trains.\nthe scale stops at "
              f"$10^{{{ceil:g}}}$ and the arrow marks cells past it: at the split corner "
              "$\\|r\\|$ reaches $10^{31}$, which no scale resolves against a band of "
              "width one.\nthe unclipped numbers are in the .txt.",
@@ -1551,8 +1514,8 @@ DW_METRICS = {
              "$\\Gamma\\to d_f$ with the write mass at $E[c_t]=d_b\\|v\\|^2$, so "
              "unlike every other mean-field curve here it does see the split, "
              "through $1/\\sqrt{d_b}$; what runs above it is eq. (17)."),
-    "disp": (r"$\|W^T\|_F\,/\,T$",
-             "the net displacement: the same steps summed before the norm",
+    "disp": (r"$\|W^T\|_F$",
+             "the net displacement: how far the state has moved from $W^0=0$",
              "$\\Gamma\\to d_f$ again, and the loosest curve in the note: it is "
              "exact at $d_f=d_b=1$, where the sum telescopes, but it decouples a "
              "gate overlap from the erasure\nthat overlap causes and so misses "
@@ -1585,21 +1548,21 @@ def case_delta_w(cfg, d_f, rho, exact=True):
     gap = 0.0
     for sd in range(cfg["SEEDS"]):
         v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, DELTAW, sd))
-        _, _, dw, disp, _ = run_stream(v, F, B, Theta, snaps)
+        _, _, dw, disp = run_stream(v, F, B, Theta, snaps)
         cum = np.cumsum(dw)
         for t in snaps:
             acc[f"step@{t}"].append(cum[t - 1] / t)
-            acc[f"disp@{t}"].append(disp[t] / t)
+            acc[f"disp@{t}"].append(disp[t])
         if exact:
-            _, _, dw_x, disp_x, _ = exact_scores(v, F, B, Theta, snaps,
-                                                 retention=False)
+            _, _, dw_x, disp_x = exact_scores(v, F, B, Theta, snaps,
+                                              retention=False)
             cum_x = np.cumsum(dw_x)
             gap = max(gap, _route_gap(dw, dw_x),
                       _route_gap([disp[t] for t in snaps],
                                  [disp_x[t] for t in snaps]))
             for t in snaps:
                 acc[f"step_x@{t}"].append(cum_x[t - 1] / t)
-                acc[f"disp_x@{t}"].append(disp_x[t] / t)
+                acc[f"disp_x@{t}"].append(disp_x[t])
     out = {"n_f": n_f, "n_b": n_b, "gap": gap}
     for k, x in acc.items():
         out[k], out[k + "_sem"], out[k + "_n"] = geo_sem(x)
@@ -1616,7 +1579,7 @@ def _mf_dw(cfg, cell, d_f, metric, T):
     d_b = cell["n_b"] / cfg["N"]
     if metric == "step":
         return mf_step(d_f, d_b, T)
-    return mf_displacement(d_f, d_b, T) / T
+    return mf_displacement(d_f, d_b, T)
 
 
 def _dw_series(cfg, cells, metric, axis, held, T):
@@ -1820,13 +1783,12 @@ def solve_check(cfg, d_f=0.3, rho=2.0, index=11):
     n_f, n_b = counts(N, d_f, rho)
     states = (K // 4, K // 2, K)
     v, F, B, Theta = draw(N, D, K, n_f, n_b, rng_for(cfg, TEST, index))
-    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, states)
-    tr_x, ret_x, dw_x, disp_x, wm_x = exact_scores(v, F, B, Theta, states)
+    tr, ret, dw, disp = run_stream(v, F, B, Theta, states)
+    tr_x, ret_x, dw_x, disp_x = exact_scores(v, F, B, Theta, states)
     return max(_route_gap(tr, tr_x),
                _route_gap(dw, dw_x),
                _route_gap([ret[s] for s in states], [ret_x[s] for s in states]),
-               _route_gap([disp[s] for s in states], [disp_x[s] for s in states]),
-               _route_gap([wm[s] for s in states], [wm_x[s] for s in states]))
+               _route_gap([disp[s] for s in states], [disp_x[s] for s in states]))
 
 
 def self_test(cfg, verbose=True):
@@ -1850,7 +1812,7 @@ def self_test(cfg, verbose=True):
     if verbose:
         print("-- the two scores at their reference states --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 40, 20, 10, rng_for(cfg, TEST, 5))
-    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (1, 2, 40))
+    tr, ret, dw, disp = run_stream(v, F, B, Theta, (1, 2, 40))
     rep("task 1 inherits W = 0, so ||r_1|| = ||theta_1|| = 1", tr[0] - 1.0, 1e-12)
     rep("retention(1) = 0: the only task trained is solved", ret[1], 1e-12)
     # two steps replayed by hand: task 2 is solved, so retention(2) is half of
@@ -1910,7 +1872,7 @@ def self_test(cfg, verbose=True):
                           rng_for(cfg, TEST, 9))
     rep("d_f = 1 gives Gamma == 1 everywhere",
         np.asarray(coupling(v, F, B)) - 1.0, 1e-12)
-    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (400,))
+    tr, ret, dw, disp = run_stream(v, F, B, Theta, (400,))
     rep("  and r_t == theta_t - theta_{t-1}",
         tr[1:] - np.linalg.norm(Theta[1:] - Theta[:-1], axis=1), 1e-12)
     rep("  r.m.s. of it == the mean field, sqrt(2)",
@@ -1922,23 +1884,16 @@ def self_test(cfg, verbose=True):
         print("-- the weight change: the step of eq. (16) is rank one --")
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 120, 24, 12, rng_for(cfg, TEST, 21))
     cw = B @ v ** 2
-    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (1, 40, 120))
+    tr, ret, dw, disp = run_stream(v, F, B, Theta, (1, 40, 120))
     rep("||W^t-W^{t-1}||_F == ||r_t||/sqrt(c_t), eqs. (15) and (16)",
         dw / (tr / np.sqrt(cw)) - 1.0, 1e-12)
     rep("the first step is ||theta_1||/sqrt(c_1), since W^0 = 0",
         dw[0] * np.sqrt(cw[0]) - 1.0, 1e-12)
     rep("the displacement never exceeds the steps that made it",
         max(0.0, (disp[120] - dw.sum()) / dw.sum()), 1e-12)
-    shape = [wm[k] * np.sqrt(cfg["N"] * cfg["D"]) / disp[k] for k in (40, 120)]
-    rep("mean |W_ia| sqrt(N N_in) / ||W||_F sits in [2/pi, sqrt(2/pi)]",
-        [max(0.0, 2.0 / np.pi / 1.05 - f, f - np.sqrt(2.0 / np.pi) * 1.05)
-         for f in shape], 0.0)
     rep("mf_step is mf_step_at averaged over the stream",
         mf_step(0.3, 0.1, 50)
         / mf_step_at(0.3, 0.1, np.arange(1, 51)).mean() - 1.0, 1e-12)
-    rep("mf_wmag is mf_displacement scaled by that same factor",
-        mf_wmag(0.3, 0.1, 50, 60, 12) * np.pi / 2.0 * np.sqrt(60 * 12)
-        / mf_displacement(0.3, 0.1, 50) - 1.0, 1e-12)
     G = coupling(v, F, B)
     R = np.asarray(solve_stream(G, Theta))
     rep("the solve is causal: rows <= k of the K-solve are the k-solve",
@@ -1957,7 +1912,7 @@ def self_test(cfg, verbose=True):
     v, F, B, Theta = draw(cfg["N"], cfg["D"], 200, cfg["N"], cfg["N"],
                           rng_for(cfg, TEST, 22))
     nv = float(np.linalg.norm(v))
-    tr, ret, dw, disp, wm = run_stream(v, F, B, Theta, (100, 200))
+    tr, ret, dw, disp = run_stream(v, F, B, Theta, (100, 200))
     rep("  ||W^t||_F == 1/||v|| for every t: sum_{s<=t} r_s = theta_t",
         [disp[s] * nv - 1.0 for s in (100, 200)], 1e-12)
     rep("  and the step is ||theta_t - theta_{t-1}|| / ||v||",
@@ -1966,16 +1921,6 @@ def self_test(cfg, verbose=True):
         [mf_displacement(1.0, 1.0, T) - 1.0 for T in (100, 200)], 1e-12)
     rep("  mf_step(1, 1, T) == the measured step, bar the estimator gap",
         dw.mean() * nv / mf_step(1.0, 1.0, 200) - 1.0, 0.05)
-    # over seeds, not on one: W = v theta_K^T/||v||^2 there, so a single seed's
-    # mean|W_ia| carries the fluctuation of mean_a|theta_a| over N_in = 12 numbers
-    ratio = []
-    for i in range(8):
-        vv, FF, BB, TT = draw(cfg["N"], cfg["D"], 120, cfg["N"], cfg["N"],
-                              rng_for(cfg, TEST, 40 + i))
-        _, _, _, dp, wmg = run_stream(vv, FF, BB, TT, (120,))
-        ratio.append(wmg[120] * np.sqrt(cfg["N"] * cfg["D"]) / dp[120])
-    rep("  and the shape factor is 2/pi there, where W is rank one",
-        float(np.mean(ratio)) / (2.0 / np.pi) - 1.0, 0.05)
 
     if verbose:
         print("-- the weight-change mean field against its own recursion --")
@@ -2021,7 +1966,7 @@ def self_test(cfg, verbose=True):
             W += stp
             if t + 1 in hand:
                 hand[t + 1].append(tot / (t + 1))
-                handd[t + 1].append(float(np.linalg.norm(W)) / (t + 1))
+                handd[t + 1].append(float(np.linalg.norm(W)))
     for T in (10, 80):
         rep(f"  step@{T} == the hand replay", cell[f"step@{T}"] / geo(hand[T]) - 1.0,
             1e-12)
@@ -2030,15 +1975,15 @@ def self_test(cfg, verbose=True):
 
     if verbose:
         print("-- one figure-2/8 case against a replay of the same seeds --")
-    # all four arms at once, which pins the two conventions figure 8 rests on: the
-    # per-task pair is pooled over the interval of arrivals ending at each state and
-    # the per-state pair is read at the state itself, after the task has trained
+    # all four arms at once, which pins the one convention figures 2, 3 and 8 rest
+    # on: every arm is read at the plotted point and nowhere else -- the per-task
+    # pair at task K, the per-state pair at state K after that task has trained --
+    # with nothing pooled over the tasks around it
     small = {**cfg, "K_TASKS": 60, "N_POINTS_DECADE": 2, "SEEDS": 2}
     res = case_vs_tasks(small, 0.3)
     pts = log_points(small["K_TASKS"], small["N_POINTS_DECADE"])
-    edges = np.concatenate([[0], pts])
     n_f, n_b = counts(cfg["N"], 0.3, 1.0)
-    arms = ("tr", "dw", "ret", "wm")
+    arms = ("tr", "dw", "ret", "disp")
     hand = {k: [[] for _ in pts] for k in arms}
     for sd in range(small["SEEDS"]):
         v, F, B, Theta = draw(cfg["N"], cfg["D"], small["K_TASKS"], n_f, n_b,
@@ -2056,15 +2001,41 @@ def self_test(cfg, verbose=True):
                 state[t + 1] = (
                     float(np.mean([np.linalg.norm(Theta[i] - (F[i] * v) @ W)
                                    for i in range(t + 1)])),
-                    float(np.abs(W).mean()))
+                    float(np.linalg.norm(W)))
         for q, p in enumerate(pts):
-            hand["tr"][q].append(geo(tr_[edges[q]:edges[q + 1]]))
-            hand["dw"][q].append(geo(dw_[edges[q]:edges[q + 1]]))
+            hand["tr"][q].append(tr_[int(p) - 1])
+            hand["dw"][q].append(dw_[int(p) - 1])
             hand["ret"][q].append(state[int(p)][0])
-            hand["wm"][q].append(state[int(p)][1])
+            hand["disp"][q].append(state[int(p)][1])
     for k in arms:
         rep(f"  {k} == the hand replay, at every one of the {pts.size} points",
             [res[k][q] / geo(hand[k][q]) - 1.0 for q in range(pts.size)], 1e-12)
+
+    if verbose:
+        print("-- figures 4 and 5: transfer is the one task, not a window --")
+    small = {**cfg, "K_DENSITY": 30, "K_HEAT": 30, "SNAPSHOTS": (3, 30),
+             "SEEDS": 2}
+    n_f, n_b = counts(cfg["N"], 0.3, 2.0)
+
+    def hand_tr(stream, sd, K):
+        """||r_t|| for every task of one seed, walked by hand."""
+        v, F, B, Theta = draw(cfg["N"], cfg["D"], K, n_f, n_b,
+                              rng_for(small, stream, sd))
+        W, cw, out = np.zeros((cfg["N"], cfg["D"])), B @ v ** 2, []
+        for t in range(K):
+            r = Theta[t] - (F[t] * v) @ W
+            out.append(float(np.linalg.norm(r)))
+            W += np.outer(B[t] * v, r) / cw[t]
+        return out
+
+    want = geo([hand_tr(DENSITY, sd, 30)[29] for sd in range(small["SEEDS"])])
+    rep("  fig 4: transfer is ||r_K|| of the last task alone",
+        case_vs_density(small, 0.3, 2.0)["tr"] / want - 1.0, 1e-12)
+    heat = case_heat(small, 0.3, 2.0)[0]
+    for k in (3, 30):
+        want = geo([hand_tr(HEAT, sd, 30)[k - 1] for sd in range(small["SEEDS"])])
+        rep(f"  fig 5: transfer at k={k:2d} is ||r_k|| of task k alone",
+            heat[k]["tr"] / want - 1.0, 1e-12)
 
     if verbose:
         print("-- the aggregator and the seeds --")
@@ -2175,12 +2146,14 @@ def main(argv):
     gap = solve_check(cfg)
     lines = [f"stream vs the exact solve (27) at K={cfg['K_CHECK']}: {gap:.3e}",
              "scores are the RAW residual, ||r||, with no normalising and no squaring.",
-             "  transfer(K)  = ||theta_K - thetahat_K^(K-1)||",
+             "  transfer(K)  = ||theta_K - thetahat_K^(K-1)||, task K's own: nothing",
+             "                 is pooled over the tasks around it",
              "  retention(K) = (1/K) sum_{i<=K} ||theta_i - thetahat_i^(K)||",
-             "the weight change, figures 6 and 7, is the step of eq. (16):",
+             "the weight change, figures 6-8, is the step of eq. (16) and its sum:",
              "  step(T)      = (1/T) sum_{t<=T} ||W^t - W^{t-1}||_F = "
              "(1/T) sum ||r_t||/sqrt(c_t)",
-             "  disp(T)      = ||W^T||_F / T, the same increments summed first",
+             "  disp(T)      = ||W^T||_F, the same increments summed first: how far",
+             "                 the state has moved from W^0 = 0, not divided by T",
              "0 = solved, 1 = no better than W = 0.  seeds combined geometrically,",
              "with +-1 s.e.m. of that mean, in logs -- the figures draw exp(+-sem).",
              "the eq.27/30 columns are the same numbers from the closed form, with",
@@ -2188,8 +2161,8 @@ def main(argv):
              ""]
     head = (f"{'retention':>14s} {'transfer':>14s}"
             f"{'ret, eq.27/30':>15s} {'tr, eq.27/30':>15s} {'route gap':>11s}")
-    head_w = (f"{'mean dW':>14s} {'mean |W|':>14s}"
-              f"{'dW, eq.27':>15s} {'|W|, eq.27':>15s} {'route gap':>11s}")
+    head_w = (f"{'dW':>14s} {'disp':>14s}"
+              f"{'dW, eq.27':>15s} {'disp, eq.27':>15s} {'route gap':>11s}")
 
     def rows(sub_cases, keys, arms):
         """One table: the two arms at the end of the stream, for each trace."""
@@ -2250,16 +2223,16 @@ def main(argv):
         print("figures 8a and 8b: the weights against task index ...")
         t_d, t_s = density_traces(cfg, dens), split_traces(cfg, split)
         fig_vs_tasks(cfg, dens, here / "fig8a_weight_vs_tasks.png", ARMS_W, t_d,
-                     "the weight change and the weight itself, one trace per density",
+                     "the step and the net displacement, one trace per density",
                      NOTE_WEIGHT, ylog=True)
         fig_vs_tasks(cfg, split, here / "fig8b_weight_vs_split.png", ARMS_W, t_s,
                      f"the same at $d_f={cfg['FIG2B_DF']:g}$, one trace per split "
                      "ratio", NOTE_WEIGHT,
                      cap=(cfg["FIG8_FLOOR"], cfg["FIG8_CEIL"]))
         lines.append(f"fig8  at the end of the stream (K={cfg['K_TASKS']}).  "
-                     "mean dW = ||W^K - W^{K-1}||_F on the arriving task;")
-        lines.append("      mean |W| = the mean of |W^K_ia| over all N x N_in "
-                     "weights, after it trained.")
+                     "dW = ||W^K - W^{K-1}||_F, the step task K took;")
+        lines.append("      disp = ||W^K||_F, how far the state has moved from "
+                     "W^0 = 0 once it trained.")
         lines.append("  8a, one trace per density (d_f = d_b)")
         lines.append(f"  {'d_f':>9s} {'n_b':>4s} " + head_w)
         lines += rows(dens, [(t[0], f"{t[3]:g}") for t in t_d], ARMS_W)
@@ -2331,7 +2304,7 @@ def main(argv):
                     pass
         for which, metric, name, what in (
                 ("6", "step", "fig6_step.png", "mean step per task"),
-                ("7", "disp", "fig7_displacement.png", "net displacement per task")):
+                ("7", "disp", "fig7_displacement.png", "net displacement ||W^T||_F")):
             if want and which not in want:
                 continue
             fig_delta_w(cfg, cells, here / name, metric)
