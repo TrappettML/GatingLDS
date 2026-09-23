@@ -123,7 +123,7 @@ CONFIG = dict(
     MAX_RATE_STEP=0.1,   # ceiling on c_t dtau
 
     # --- figures 2 and 3, against task index -------------------------------
-    K_TASKS=5000,    # stream length
+    K_TASKS=10000,    # stream length
     DENSITIES=(0.5, 0.3, 0.2, 0.1),   # figure 2: d_f = d_b, one trace each
     SPLIT_DENSITIES=(0.5, 0.3, 0.2),  # figure 3: one row each
     SPLIT_RHOS=(1.0, 2.0, 5.0),       # figure 3: one trace each
